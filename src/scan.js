@@ -102,9 +102,7 @@ async function fetchOKXTickers() {
     .filter(item => item.instId.endsWith("-USDT-SWAP"))
     .map(item => {
       const base = item.instId.split("-")[0];
-      const last = parseFloat(item.last || "0");
-      const volCcy = parseFloat(item.volCcy24h || "0");
-      const volume = last * volCcy;
+      const volume = parseFloat(item.volCcy24h || "0");
       return { symbol: `${base}USDT`, volume: Number.isFinite(volume) ? volume : 0 };
     });
 }
@@ -243,7 +241,7 @@ async function getCandles(symbol, exchange) {
           high: Number(row[2]),
           low: Number(row[3]),
           close: Number(row[4]),
-          closed: Number(row[0]) + CONFIG.INTERVAL_MS <= Date.now(),
+          closed: Number(row[0]) + CONFIG.INTERVAL_MS + 30000 <= Date.now(),
         }));
       } else if (currentExchange === "toobit") {
         const json = await toobitFetch("/quote/v1/klines", {
@@ -258,7 +256,7 @@ async function getCandles(symbol, exchange) {
           high: Number(row[2]),
           low: Number(row[3]),
           close: Number(row[4]),
-          closed: Number(row[6]) < Date.now(),
+          closed: Number(row[6]) + 30000 <= Date.now(),
         }));
       }
 
@@ -283,18 +281,28 @@ async function getCandles(symbol, exchange) {
   throw lastError || new Error("no candles");
 }
 
-function isDoji(candle) {
+function dojiType(candle) {
   const range = candle.high - candle.low;
-  if (range <= 0) return false;
+  if (range <= 0) return null;
   const body = Math.abs(candle.close - candle.open);
+  if (body / range > CONFIG.DOJI_MAX_BODY_RATIO) return null;
   const upperWick = candle.high - Math.max(candle.open, candle.close);
   const lowerWick = Math.min(candle.open, candle.close) - candle.low;
-  if (body / range > CONFIG.DOJI_MAX_BODY_RATIO) return false;
-  if (upperWick < 0 || lowerWick < 0) return false;
+  if (upperWick < 0 || lowerWick < 0) return null;
   const wickSum = upperWick + lowerWick;
-  if (wickSum <= 0) return false;
-  if (Math.abs(upperWick - lowerWick) / wickSum > CONFIG.WICK_SYMMETRY_TOLERANCE) return false;
-  return true;
+  if (wickSum <= 0) return null;
+
+  const upperRatio = upperWick / range;
+  const lowerRatio = lowerWick / range;
+
+  if (upperRatio <= 0.05 && lowerRatio >= 0.60) return "dragonfly";
+  if (lowerRatio <= 0.05 && upperRatio >= 0.60) return "gravestone";
+  if (Math.abs(upperWick - lowerWick) / wickSum <= CONFIG.WICK_SYMMETRY_TOLERANCE) return "standard";
+  return null;
+}
+
+function isDoji(candle) {
+  return dojiType(candle) !== null;
 }
 
 function atrCalc(candles, period = 14) {
@@ -315,45 +323,75 @@ function atrCalc(candles, period = 14) {
 function analyzeSymbol(candles) {
   if (candles.length < 30) return null;
 
-  const signals = [];
   const atrValue = atrCalc(candles);
+  if (!Number.isFinite(atrValue) || atrValue <= 0) return null;
+
+  const lastConfirmIdx = candles.length - 1;
   const firstIndex = Math.max(2, candles.length - CONFIG.HISTORY_CANDLES - 1);
 
-  for (let i = firstIndex; i < candles.length - 1; i++) {
-    const preCandle = candles[i - 1];
+  for (let i = firstIndex; i < lastConfirmIdx; i++) {
     const doji = candles[i];
     const confirmation = candles[i + 1];
 
-    if (!isDoji(doji)) continue;
-    if (preCandle.high - preCandle.low < atrValue) continue;
+    const kind = dojiType(doji);
+    if (!kind) continue;
 
     const dojiRange = doji.high - doji.low;
     const confRange = confirmation.high - confirmation.low;
     if (!Number.isFinite(dojiRange) || !Number.isFinite(confRange) || dojiRange <= 0) continue;
+    if (confRange < atrValue * 0.5) continue;
+
+    const confBody = Math.abs(confirmation.close - confirmation.open);
+    if (confBody < atrValue * 0.3) continue;
 
     const isGreen = confirmation.close > confirmation.open;
     const isRed = confirmation.close < confirmation.open;
     if (!isGreen && !isRed) continue;
 
     const direction = isGreen ? "LONG" : "SHORT";
-    if (confRange < dojiRange * 0.5) continue;
 
-    const entry = confirmation.close;
-    const sl = direction === "LONG" ? doji.low : doji.high;
-    const risk = Math.abs(entry - sl);
-    if (risk <= 0) continue;
-    if ((risk / entry) * 100 < 0.3) continue;
+    if (kind === "dragonfly" && direction !== "LONG") continue;
+    if (kind === "gravestone" && direction !== "SHORT") continue;
 
     let recentHigh = -Infinity, recentLow = Infinity;
     for (let j = Math.max(0, i - 100); j < i; j++) {
       if (candles[j].high > recentHigh) recentHigh = candles[j].high;
       if (candles[j].low < recentLow) recentLow = candles[j].low;
     }
+    if (!Number.isFinite(recentHigh) || !Number.isFinite(recentLow)) continue;
 
-    if (direction === "LONG" && doji.high > recentHigh * 0.998) continue;
-    if (direction === "SHORT" && doji.low < recentLow * 1.002) continue;
+    const dojiMid = (doji.high + doji.low) / 2;
+    const range100 = recentHigh - recentLow;
+    if (range100 <= 0) continue;
 
-    const tp = direction === "LONG" ? entry + risk * 2 : entry - risk * 2;
+    if (direction === "LONG") {
+      if (doji.low > recentLow + range100 * 0.35) continue;
+      if (doji.high > recentHigh * 0.998) continue;
+      if (dojiMid > (recentHigh + recentLow) / 2) continue;
+    } else {
+      if (doji.high < recentHigh - range100 * 0.35) continue;
+      if (doji.low < recentLow * 1.002) continue;
+      if (dojiMid < (recentHigh + recentLow) / 2) continue;
+    }
+
+    const entry = confirmation.close;
+    const buffer = dojiRange * CONFIG.SL_BUFFER_PERCENT;
+    const sl = direction === "LONG" ? doji.low - buffer : doji.high + buffer;
+    const risk = Math.abs(entry - sl);
+    if (risk <= 0) continue;
+    if (risk < atrValue * 0.3) continue;
+
+    let structuralTp = direction === "LONG" ? entry + risk * 2 : entry - risk * 2;
+    for (let j = i - 1; j >= Math.max(0, i - 100); j--) {
+      if (direction === "LONG") {
+        const level = candles[j].high;
+        if (level > entry + risk * 1.0 && level < structuralTp) structuralTp = level;
+      } else {
+        const level = candles[j].low;
+        if (level < entry - risk * 1.0 && level > structuralTp) structuralTp = level;
+      }
+    }
+    const tp = structuralTp;
 
     let tradeStatus = "OPEN";
     for (let j = i + 2; j < candles.length; j++) {
@@ -367,10 +405,17 @@ function analyzeSymbol(candles) {
       }
     }
 
-    signals.push({ direction, entry, sl, risk, tp, tradeStatus, dojiTime: doji.time, confirmationTime: confirmation.time, currentPrice: candles[candles.length - 1].close });
+    if (i + 1 !== lastConfirmIdx) continue;
+
+    return {
+      direction, kind, entry, sl, risk, tp, tradeStatus,
+      dojiTime: doji.time,
+      confirmationTime: confirmation.time,
+      currentPrice: candles[candles.length - 1].close,
+    };
   }
 
-  return signals.length > 0 ? signals[signals.length - 1] : null;
+  return null;
 }
 
 function fmtPrice(v) {
@@ -382,18 +427,22 @@ function fmtTime(ts) {
   return new Date(ts).toISOString().replace("T", " ").slice(0, 16) + " UTC";
 }
 
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 function formatSignal(symbol, sig) {
   const isLong = sig.direction === "LONG";
-  const icon = isLong ? "🟢" : "🔴";
+  const dirIcon = isLong ? "🟢" : "🔴";
   const dirText = isLong ? "LONG" : "SHORT";
 
   let statusText = "", statusIcon = "";
   if (sig.tradeStatus === "TP_HIT") {
-    statusText = "✅ برنده (تارگت زده شد)";
-    statusIcon = "🟢";
+    statusText = "برنده (تارگت زده شد)";
+    statusIcon = "✅";
   } else if (sig.tradeStatus === "SL_HIT") {
-    statusText = "❌ بازنده (استاپ خورد)";
-    statusIcon = "🔴";
+    statusText = "بازنده (استاپ خورد)";
+    statusIcon = "❌";
   } else {
     const diff = isLong ? (sig.currentPrice - sig.entry) : (sig.entry - sig.currentPrice);
     const currentR = sig.risk > 0 ? diff / sig.risk : 0;
@@ -401,18 +450,22 @@ function formatSignal(symbol, sig) {
     statusIcon = "⏳";
   }
 
+  const kindLabel = sig.kind === "dragonfly" ? "Dragonfly"
+    : sig.kind === "gravestone" ? "Gravestone"
+    : "Standard";
+
   return (
     "📊 <b>تحلیل Doji</b>\n\n" +
-    `${statusIcon} <b>${symbol}</b>\n` +
+    `${dirIcon} <b>${escapeHtml(symbol)}</b>\n` +
     "⏱ تایم‌فریم: 15m\n" +
-    `📌 وضعیت: ${icon} <b>${dirText}</b>\n\n` +
+    `📌 وضعیت: ${dirIcon} <b>${dirText}</b>\n\n` +
     `💰 قیمت فعلی: <b>${fmtPrice(sig.currentPrice)}</b>\n\n` +
     "🎯 <b>Doji Setup فعال:</b>\n" +
-    `📌 نوع: <b>${icon} ${dirText}</b>\n` +
+    `🕯 نوع دوجی: <b>${kindLabel}</b>\n` +
     `🎯 ورود: <b>${fmtPrice(sig.entry)}</b>\n` +
     `🛑 حد ضرر: <b>${fmtPrice(sig.sl)}</b>\n` +
     `📏 ریسک: <b>${fmtPrice(sig.risk)}</b>\n\n` +
-    `🥇 TP: <b>${fmtPrice(sig.tp)}</b> (2.00R)\n\n` +
+    `🥇 TP: <b>${fmtPrice(sig.tp)}</b>\n\n` +
     `${statusIcon} <b>نتیجه: ${statusText}</b>\n` +
     `🕯 زمان تأیید: ${fmtTime(sig.confirmationTime)}\n\n` +
     "━━━━━━━━━━━━━━━━━━━━━━\n" +
