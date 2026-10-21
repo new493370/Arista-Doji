@@ -1,242 +1,286 @@
 const EXCHANGES = {
-  okx: {
-    name: "OKX",
-    base: "https://www.okx.com",
-  },
-  bybit: {
-    name: "Bybit",
-    base: "https://api.bybit.com",
-  },
-  toobit: {
-    name: "Toobit",
-    base: "https://api.toobit.com",
-  },
+  okx: { name: "OKX", base: "https://www.okx.com" },
+  bybit: { name: "Bybit", base: "https://api.bybit.com" },
+  toobit: { name: "Toobit", base: "https://api.toobit.com" },
 };
 
 const CONFIG = {
   TIMEFRAME: "15m",
   INTERVAL_MS: 15 * 60 * 1000,
-
   HISTORY_CANDLES: 5,
   FETCH_CANDLES: 130,
-
   DOJI_MAX_BODY_RATIO: 0.10,
   WICK_SYMMETRY_TOLERANCE: 0.10,
   SL_BUFFER_PERCENT: 0,
-
-  TOP_SYMBOL_COUNT: 20,
-  MIN_24H_VOLUME: 10000,
-
-  ANALYSIS_ORDER: ["toobit", "okx", "bybit"],
-
+  TOP_SYMBOL_COUNT: 30,
+  MIN_QUOTE_VOLUME_24H: 500000,
+  ANALYSIS_ORDER: ["okx", "bybit", "toobit"],
   API_MAX_RETRIES: 3,
-  API_RETRY_DELAY_MS: 1000,
-
   MESSAGE_DELAY_MS: 1500,
   TOTAL_TIMEOUT_MS: 12 * 60 * 1000,
 };
 
-async function okxFetch(path, params = {}) {
-  const url = new URL(EXCHANGES.okx.base + path);
-  for (const [key, value] of Object.entries(params)) {
-    url.searchParams.set(key, value);
-  }
-
-  for (let attempt = 0; attempt < CONFIG.API_MAX_RETRIES; attempt++) {
-    const response = await fetch(url.toString(), {
-      headers: { Accept: "application/json" },
-    });
-
-    if (response.status === 429) {
-      const retryAfter = response.headers.get("Retry-After");
-      const retrySeconds = parseFloat(retryAfter);
-      await new Promise(r => setTimeout(r, retrySeconds > 0 ? retrySeconds * 1000 : 1000 * (attempt + 1)));
-      continue;
-    }
-
-    if (!response.ok) {
-      throw new Error(`OKX HTTP ${response.status}`);
-    }
-
-    const json = await response.json();
-    if (json.code !== "0") {
-      throw new Error(`OKX error: ${json.msg || "unknown"}`);
-    }
-    return json;
-  }
-  throw new Error("OKX خطای نهایی پس از تلاش‌های مکرر");
+async function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
 }
 
-async function genericFetch(baseUrl, path, params = {}) {
-  const url = new URL(baseUrl + path);
-  for (const [key, value] of Object.entries(params)) {
-    url.searchParams.set(key, value);
-  }
+async function okxFetch(path, params = {}) {
+  const url = new URL(EXCHANGES.okx.base + path);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
 
   for (let attempt = 0; attempt < CONFIG.API_MAX_RETRIES; attempt++) {
-    const response = await fetch(url.toString(), {
-      headers: { Accept: "application/json" },
-    });
+    const response = await fetch(url.toString(), { headers: { Accept: "application/json" } });
 
     if (response.status === 429) {
-      await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      const retryAfter = parseFloat(response.headers.get("Retry-After") || "0");
+      await sleep(retryAfter > 0 ? retryAfter * 1000 : 1000 * (attempt + 1));
       continue;
     }
 
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) throw new Error(`OKX HTTP ${response.status}`);
+
+    const json = await response.json();
+    if (json.code !== "0") throw new Error(`OKX: ${json.msg || "unknown"}`);
+    return json;
+  }
+  throw new Error("OKX failed after retries");
+}
+
+async function bybitFetch(path, params = {}) {
+  const url = new URL(EXCHANGES.bybit.base + path);
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
+
+  for (let attempt = 0; attempt < CONFIG.API_MAX_RETRIES; attempt++) {
+    const response = await fetch(url.toString(), { headers: { Accept: "application/json" } });
+
+    if (response.status === 429) {
+      await sleep(1000 * (attempt + 1));
+      continue;
     }
 
-    return await response.json();
+    if (!response.ok) throw new Error(`Bybit HTTP ${response.status}`);
+
+    const json = await response.json();
+    if (json.retCode !== 0) throw new Error(`Bybit: ${json.retMsg || "unknown"}`);
+    return json;
   }
-  throw new Error("HTTP خطای نهایی پس از تلاش‌های مکرر");
+  throw new Error("Bybit failed after retries");
 }
 
 async function toobitFetch(path, params = {}) {
   const url = new URL(EXCHANGES.toobit.base + path);
-  for (const [key, value] of Object.entries(params)) {
-    url.searchParams.set(key, value);
-  }
+  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
 
   for (let attempt = 0; attempt < CONFIG.API_MAX_RETRIES; attempt++) {
-    const response = await fetch(url.toString(), {
-      headers: { Accept: "application/json" },
-    });
+    const response = await fetch(url.toString(), { headers: { Accept: "application/json" } });
 
     if (response.status === 429) {
-      await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      await sleep(1000 * (attempt + 1));
       continue;
     }
 
-    if (!response.ok) {
-      throw new Error(`Toobit HTTP ${response.status}`);
-    }
+    if (!response.ok) throw new Error(`Toobit HTTP ${response.status}`);
 
     return await response.json();
   }
-  throw new Error("Toobit خطای نهایی پس از تلاش‌های مکرر");
+  throw new Error("Toobit failed after retries");
+}
+
+async function fetchOKXSymbols() {
+  const json = await okxFetch("/api/v5/public/instruments", { instType: "SWAP" });
+  return json.data
+    .filter(item => item.state === "live" && item.settleCcy === "USDT" && item.ctType === "linear" && item.instId.endsWith("-USDT-SWAP"))
+    .map(item => {
+      const base = item.ctValCcy || item.instId.split("-")[0];
+      return { symbol: `${base}USDT`, base, exchange: "okx", raw: item.instId };
+    });
+}
+
+async function fetchOKXTickers() {
+  const json = await okxFetch("/api/v5/market/tickers", { instType: "SWAP" });
+  return json.data
+    .filter(item => item.instId.endsWith("-USDT-SWAP"))
+    .map(item => {
+      const base = item.instId.split("-")[0];
+      const last = parseFloat(item.last || "0");
+      const volCcy = parseFloat(item.volCcy24h || "0");
+      const volume = last * volCcy;
+      return { symbol: `${base}USDT`, volume: Number.isFinite(volume) ? volume : 0 };
+    });
+}
+
+async function fetchBybitSymbols() {
+  const json = await bybitFetch("/v5/market/instruments-info", { category: "linear", limit: "1000" });
+  return json.result.list
+    .filter(item => item.status === "Trading" && item.quoteCoin === "USDT" && item.contractType === "LinearPerpetual")
+    .map(item => ({ symbol: item.symbol, base: item.baseCoin, exchange: "bybit", raw: item.symbol }));
+}
+
+async function fetchBybitTickers() {
+  const json = await bybitFetch("/v5/market/tickers", { category: "linear" });
+  return json.result.list
+    .filter(item => item.symbol.endsWith("USDT"))
+    .map(item => ({ symbol: item.symbol, volume: parseFloat(item.turnover24h || "0") }));
+}
+
+async function fetchToobitSymbols() {
+  const json = await toobitFetch("/api/v1/exchangeInfo");
+  return (json.contracts || [])
+    .filter(item => item.status === "TRADING" && item.inverse === false && item.symbol.endsWith("-SWAP-USDT"))
+    .map(item => {
+      const raw = item.symbol;
+      const base = item.underlying || raw.split("-")[0];
+      return { symbol: `${base}USDT`, base, exchange: "toobit", raw };
+    });
+}
+
+async function fetchToobitTickers() {
+  const json = await toobitFetch("/quote/v1/contract/ticker/24hr");
+  const rows = Array.isArray(json) ? json : (json?.data || json?.result || []);
+  return rows
+    .map(item => {
+      const raw = String(item.s || item.symbol || "");
+      const normalized = raw.replace("-SWAP-USDT", "USDT");
+      const volume = parseFloat(item.qv || item.quoteVolume || item.volume || "0");
+      return { symbol: normalized, volume: Number.isFinite(volume) ? volume : 0 };
+    })
+    .filter(x => x.symbol && x.volume > 0);
 }
 
 async function getTopSymbols() {
-  const allSymbolsMap = new Map();
+  const allCandidates = [];
 
-  const attempts = CONFIG.ANALYSIS_ORDER.map(async (exchange) => {
-    let symbols = [];
-    let tickers = [];
+  const attempts = [
+    { name: "okx", fetchSymbols: fetchOKXSymbols, fetchTickers: fetchOKXTickers },
+    { name: "bybit", fetchSymbols: fetchBybitSymbols, fetchTickers: fetchBybitTickers },
+    { name: "toobit", fetchSymbols: fetchToobitSymbols, fetchTickers: fetchToobitTickers },
+  ];
 
-    if (exchange === "okx") {
-      const json = await okxFetch("/api/v5/public/instruments", { instType: "SWAP" });
-      symbols = json.data.filter(item => item.state === "live" && item.settleCcy === "USDT" && item.ctType === "linear" && item.instId.endsWith("-USDT-SWAP")).map(item => {
-        const base = item.ctValCcy || item.instId.split("-")[0];
-        return { symbol: `${base}USDT`, base, exchange: "okx", raw: item.instId };
-      });
-      
-      const tickerJson = await okxFetch("/api/v5/market/tickers", { instType: "SWAP" });
-      tickers = tickerJson.data;
-    } else if (exchange === "bybit") {
-      const json = await genericFetch(EXCHANGES.bybit.base, "/v5/market/instruments-info", { category: "linear", limit: "1000" });
-      symbols = json.result.list.filter(item => item.status === "Trading" && item.quoteCoin === "USDT" && item.contractType === "LinearPerpetual").map(item => ({ symbol: item.symbol, base: item.baseCoin, exchange: "bybit", raw: item.symbol }));
+  const order = CONFIG.ANALYSIS_ORDER.map(name => attempts.find(a => a.name === name)).filter(Boolean);
 
-      const tickerJson = await genericFetch(EXCHANGES.bybit.base, "/v5/market/tickers", { category: "linear" });
-      tickers = tickerJson.result.list;
-    } else if (exchange === "toobit") {
-      const json = await toobitFetch("/api/v1/exchangeInfo");
-      symbols = (json.contracts || []).filter(item => item.status === "TRADING" && item.inverse === false && item.symbol.endsWith("-SWAP-USDT")).map(item => {
-        const raw = item.symbol;
-        const base = item.underlying || raw.split("-")[0];
-        return { symbol: `${base}USDT`, base, exchange: "toobit", raw };
-      });
+  for (const exchange of order) {
+    try {
+      console.log(`  Trying ${exchange.name}...`);
+      const symbols = await exchange.fetchSymbols();
+      const tickers = await exchange.fetchTickers();
 
-      const tickerJson = await toobitFetch("/quote/v1/contract/ticker/24hr");
-      tickers = Array.isArray(tickerJson) ? tickerJson : tickerJson.data || [];
-    }
+      console.log(`  ✅ ${exchange.name}: ${symbols.length} symbols fetched, ${tickers.length} tickers`);
 
-    if (symbols.length === 0) throw new Error("لیست خالی");
-
-    return { symbols, tickers, exchange };
-  });
-
-  try {
-    const result = await Promise.any(attempts);
-    const { symbols, tickers, exchange } = result;
-
-    const tickerMap = new Map();
-    for (const t of tickers) {
-      let sym = "";
-      let volume = 0;
-      if (exchange === "okx") {
-        sym = t.instId.replace("-SWAP", "");
-        const last = parseFloat(t.last || "0");
-        const vol = parseFloat(t.volCcy24h || "0");
-        volume = last * vol;
-      } else if (exchange === "bybit") {
-        sym = t.symbol;
-        volume = parseFloat(t.turnover24h || "0");
-      } else if (exchange === "toobit") {
-        sym = t.s.replace("-SWAP-USDT", "USDT");
-        volume = parseFloat(t.qv || "0");
+      if (!symbols || symbols.length === 0) {
+        console.log(`  ❌ ${exchange.name}: empty symbols list`);
+        continue;
       }
-      tickerMap.set(sym, volume);
+
+      const volumeMap = new Map(tickers.map(t => [t.symbol, t.volume]));
+
+      const ranked = symbols
+        .map(s => ({ ...s, volume: volumeMap.get(s.symbol) || 0 }))
+        .filter(s => s.volume >= CONFIG.MIN_QUOTE_VOLUME_24H)
+        .sort((a, b) => b.volume - a.volume);
+
+      console.log(`  ✅ ${exchange.name}: ${ranked.length} symbols after volume filter (min: ${CONFIG.MIN_QUOTE_VOLUME_24H})`);
+
+      allCandidates.push(...ranked);
+    } catch (e) {
+      console.log(`  ❌ ${exchange.name}: ${e.message}`);
     }
-
-    const ranked = symbols.map(s => ({
-      ...s,
-      volume: tickerMap.get(s.symbol) || 0
-    })).filter(s => s.volume >= CONFIG.MIN_24H_VOLUME);
-
-    ranked.sort((a, b) => b.volume - a.volume);
-
-    return ranked.slice(0, CONFIG.TOP_SYMBOL_COUNT);
-  } catch (e) {
-    throw new Error("خطا در دریافت لیست ارزها از تمام صرافی‌ها");
   }
+
+  if (allCandidates.length === 0) {
+    throw new Error("No symbols from any exchange");
+  }
+
+  const uniqueMap = new Map();
+  for (const item of allCandidates) {
+    if (!uniqueMap.has(item.symbol)) {
+      uniqueMap.set(item.symbol, item);
+    }
+  }
+
+  const combined = [...uniqueMap.values()]
+    .sort((a, b) => b.volume - a.volume)
+    .slice(0, CONFIG.TOP_SYMBOL_COUNT);
+
+  return combined;
 }
 
 async function getCandles(symbol, exchange) {
   const base = symbol.replace(/USDT$/, "");
   const exchangesToTry = [exchange, ...CONFIG.ANALYSIS_ORDER.filter(e => e !== exchange)];
 
-  const attempts = exchangesToTry.map(async (currentExchange) => {
-    let candles = [];
+  let lastError = null;
 
-    if (currentExchange === "okx") {
-      const params = { instId: `${base}-USDT-SWAP`, bar: "15m", limit: String(CONFIG.FETCH_CANDLES) };
-      const json = await okxFetch("/api/v5/market/candles", params);
-      if (!Array.isArray(json.data)) throw new Error("OKX candle error");
-      candles = json.data.map(row => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), closed: row[8] === "1" }));
-    } else if (currentExchange === "bybit") {
-      const params = { category: "linear", symbol, interval: "15", limit: String(CONFIG.FETCH_CANDLES) };
-      const json = await genericFetch(EXCHANGES.bybit.base, "/v5/market/kline", params);
-      if (!Array.isArray(json.result?.list)) throw new Error("Bybit candle error");
-      candles = json.result.list.map(row => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), closed: Number(row[0]) + CONFIG.INTERVAL_MS <= Date.now() }));
-    } else if (currentExchange === "toobit") {
-      const params = { symbol: `${base}-SWAP-USDT`, interval: "15m", limit: String(CONFIG.FETCH_CANDLES) };
-      const json = await toobitFetch("/quote/v1/klines", params);
-      if (!Array.isArray(json)) throw new Error("Toobit candle error");
-      candles = json.map(row => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), closed: Number(row[6]) < Date.now() }));
+  for (const currentExchange of exchangesToTry) {
+    try {
+      let candles = [];
+
+      if (currentExchange === "okx") {
+        const json = await okxFetch("/api/v5/market/candles", {
+          instId: `${base}-USDT-SWAP`,
+          bar: "15m",
+          limit: String(CONFIG.FETCH_CANDLES),
+        });
+        if (!Array.isArray(json.data)) throw new Error("invalid");
+        candles = json.data.map(row => ({
+          time: Number(row[0]),
+          open: Number(row[1]),
+          high: Number(row[2]),
+          low: Number(row[3]),
+          close: Number(row[4]),
+          closed: row[8] === "1",
+        }));
+      } else if (currentExchange === "bybit") {
+        const json = await bybitFetch("/v5/market/kline", {
+          category: "linear",
+          symbol,
+          interval: "15",
+          limit: String(CONFIG.FETCH_CANDLES),
+        });
+        if (!Array.isArray(json.result?.list)) throw new Error("invalid");
+        candles = json.result.list.map(row => ({
+          time: Number(row[0]),
+          open: Number(row[1]),
+          high: Number(row[2]),
+          low: Number(row[3]),
+          close: Number(row[4]),
+          closed: Number(row[0]) + CONFIG.INTERVAL_MS <= Date.now(),
+        }));
+      } else if (currentExchange === "toobit") {
+        const json = await toobitFetch("/quote/v1/klines", {
+          symbol: `${base}-SWAP-USDT`,
+          interval: "15m",
+          limit: String(CONFIG.FETCH_CANDLES),
+        });
+        if (!Array.isArray(json)) throw new Error("invalid");
+        candles = json.map(row => ({
+          time: Number(row[0]),
+          open: Number(row[1]),
+          high: Number(row[2]),
+          low: Number(row[3]),
+          close: Number(row[4]),
+          closed: Number(row[6]) < Date.now(),
+        }));
+      }
+
+      candles.sort((a, b) => a.time - b.time);
+      const closed = candles.filter(c => c.closed && Number.isFinite(c.time) && Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close));
+
+      const unique = [];
+      const seen = new Set();
+      for (const c of closed) {
+        if (seen.has(c.time)) continue;
+        seen.add(c.time);
+        unique.push(c);
+      }
+
+      if (unique.length >= 30) return unique.slice(-CONFIG.FETCH_CANDLES);
+      throw new Error(`only ${unique.length} candles`);
+    } catch (e) {
+      lastError = e;
     }
-
-    candles.sort((a, b) => a.time - b.time);
-    const closed = candles.filter(c => c.closed && Number.isFinite(c.time) && Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close));
-
-    const unique = [];
-    const seen = new Set();
-    for (const c of closed) {
-      if (seen.has(c.time)) continue;
-      seen.add(c.time);
-      unique.push(c);
-    }
-
-    if (unique.length < 30) throw new Error(`داده کافی نیست (${unique.length})`);
-    return unique.slice(-CONFIG.FETCH_CANDLES);
-  });
-
-  try {
-    const result = await Promise.any(attempts);
-    return result;
-  } catch (e) {
-    throw new Error(`داده‌ای برای ${symbol} از هیچ صرافی یافت نشد.`);
   }
+
+  throw lastError || new Error("no candles");
 }
 
 function isDoji(candle) {
@@ -245,13 +289,12 @@ function isDoji(candle) {
   const body = Math.abs(candle.close - candle.open);
   const upperWick = candle.high - Math.max(candle.open, candle.close);
   const lowerWick = Math.min(candle.open, candle.close) - candle.low;
-  const bodyRatio = body / range;
-  if (bodyRatio > CONFIG.DOJI_MAX_BODY_RATIO) return false;
+  if (body / range > CONFIG.DOJI_MAX_BODY_RATIO) return false;
   if (upperWick < 0 || lowerWick < 0) return false;
   const wickSum = upperWick + lowerWick;
   if (wickSum <= 0) return false;
-  const wickDifference = Math.abs(upperWick - lowerWick) / wickSum;
-  return wickDifference <= CONFIG.WICK_SYMMETRY_TOLERANCE;
+  if (Math.abs(upperWick - lowerWick) / wickSum > CONFIG.WICK_SYMMETRY_TOLERANCE) return false;
+  return true;
 }
 
 function atrCalc(candles, period = 14) {
@@ -262,12 +305,11 @@ function atrCalc(candles, period = 14) {
     if (i === 0) {
       trs.push(c.high - c.low);
     } else {
-      const prevClose = candles[i - 1].close;
-      trs.push(Math.max(c.high - c.low, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose)));
+      const pc = candles[i - 1].close;
+      trs.push(Math.max(c.high - c.low, Math.abs(c.high - pc), Math.abs(c.low - pc)));
     }
   }
-  const lastTrs = trs.slice(-period);
-  return lastTrs.reduce((a, b) => a + b, 0) / period;
+  return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
 }
 
 function analyzeSymbol(candles) {
@@ -283,44 +325,35 @@ function analyzeSymbol(candles) {
     const confirmation = candles[i + 1];
 
     if (!isDoji(doji)) continue;
-
-    const preRange = preCandle.high - preCandle.low;
-    if (preRange < atrValue) continue;
+    if (preCandle.high - preCandle.low < atrValue) continue;
 
     const dojiRange = doji.high - doji.low;
-    const confirmationRange = confirmation.high - confirmation.low;
-    if (!Number.isFinite(dojiRange) || !Number.isFinite(confirmationRange) || dojiRange <= 0) continue;
+    const confRange = confirmation.high - confirmation.low;
+    if (!Number.isFinite(dojiRange) || !Number.isFinite(confRange) || dojiRange <= 0) continue;
 
     const isGreen = confirmation.close > confirmation.open;
     const isRed = confirmation.close < confirmation.open;
     if (!isGreen && !isRed) continue;
 
     const direction = isGreen ? "LONG" : "SHORT";
-    if (confirmationRange < dojiRange * 0.5) continue;
+    if (confRange < dojiRange * 0.5) continue;
 
     const entry = confirmation.close;
-    const buffer = (entry * CONFIG.SL_BUFFER_PERCENT) / 100;
-    const sl = direction === "LONG" ? doji.low - buffer : doji.high + buffer;
+    const sl = direction === "LONG" ? doji.low : doji.high;
     const risk = Math.abs(entry - sl);
     if (risk <= 0) continue;
+    if ((risk / entry) * 100 < 0.3) continue;
 
-    const slPercent = (risk / entry) * 100;
-    if (slPercent < 0.3) continue;
-
-    let recentHigh = -Infinity;
-    let recentLow = Infinity;
+    let recentHigh = -Infinity, recentLow = Infinity;
     for (let j = Math.max(0, i - 100); j < i; j++) {
       if (candles[j].high > recentHigh) recentHigh = candles[j].high;
       if (candles[j].low < recentLow) recentLow = candles[j].low;
     }
 
-    if (direction === "LONG") {
-      if (doji.high > recentHigh * 0.998) continue;
-    } else if (direction === "SHORT") {
-      if (doji.low < recentLow * 1.002) continue;
-    }
+    if (direction === "LONG" && doji.high > recentHigh * 0.998) continue;
+    if (direction === "SHORT" && doji.low < recentLow * 1.002) continue;
 
-    const tp = direction === "LONG" ? entry + (risk * 2) : entry - (risk * 2);
+    const tp = direction === "LONG" ? entry + risk * 2 : entry - risk * 2;
 
     let tradeStatus = "OPEN";
     for (let j = i + 2; j < candles.length; j++) {
@@ -334,58 +367,37 @@ function analyzeSymbol(candles) {
       }
     }
 
-    signals.push({
-      direction,
-      entry,
-      sl,
-      risk,
-      tp,
-      tradeStatus,
-      dojiTime: doji.time,
-      confirmationTime: confirmation.time,
-      currentPrice: candles[candles.length - 1].close,
-    });
+    signals.push({ direction, entry, sl, risk, tp, tradeStatus, dojiTime: doji.time, confirmationTime: confirmation.time, currentPrice: candles[candles.length - 1].close });
   }
 
-  if (signals.length === 0) return null;
-  return signals[signals.length - 1];
+  return signals.length > 0 ? signals[signals.length - 1] : null;
 }
 
-function formatPrice(value) {
-  if (!Number.isFinite(value)) return "N/A";
-  return value.toLocaleString("en-US", {
-    maximumFractionDigits: 10,
-    useGrouping: false,
-  });
+function fmtPrice(v) {
+  if (!Number.isFinite(v)) return "N/A";
+  return v.toLocaleString("en-US", { maximumFractionDigits: 10, useGrouping: false });
 }
 
-function formatTime(timestamp) {
-  return new Date(timestamp).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+function fmtTime(ts) {
+  return new Date(ts).toISOString().replace("T", " ").slice(0, 16) + " UTC";
 }
 
-function formatSignal(symbol, signal) {
-  const isLong = signal.direction === "LONG";
-  const directionText = isLong ? "🟢 LONG" : "🔴 SHORT";
+function formatSignal(symbol, sig) {
+  const isLong = sig.direction === "LONG";
   const icon = isLong ? "🟢" : "🔴";
-  const label = isLong ? "LONG" : "SHORT";
+  const dirText = isLong ? "LONG" : "SHORT";
 
-  const currentPrice = signal.currentPrice;
-  let tradeStatusText = "";
-  let statusIcon = "";
-
-  if (signal.tradeStatus === "TP_HIT") {
-    tradeStatusText = "✅ برنده (تارگت زده شد)";
+  let statusText = "", statusIcon = "";
+  if (sig.tradeStatus === "TP_HIT") {
+    statusText = "✅ برنده (تارگت زده شد)";
     statusIcon = "🟢";
-  } else if (signal.tradeStatus === "SL_HIT") {
-    tradeStatusText = "❌ بازنده (استاپ خورد)";
+  } else if (sig.tradeStatus === "SL_HIT") {
+    statusText = "❌ بازنده (استاپ خورد)";
     statusIcon = "🔴";
   } else {
-    let currentR = 0;
-    if (signal.risk > 0) {
-      const diff = isLong ? (currentPrice - signal.entry) : (signal.entry - currentPrice);
-      currentR = diff / signal.risk;
-    }
-    tradeStatusText = `معامله باز است (R فعلی: ${currentR.toFixed(2)})`;
+    const diff = isLong ? (sig.currentPrice - sig.entry) : (sig.entry - sig.currentPrice);
+    const currentR = sig.risk > 0 ? diff / sig.risk : 0;
+    statusText = `معامله باز است (R فعلی: ${currentR.toFixed(2)})`;
     statusIcon = "⏳";
   }
 
@@ -393,44 +405,33 @@ function formatSignal(symbol, signal) {
     "📊 <b>تحلیل Doji</b>\n\n" +
     `${statusIcon} <b>${symbol}</b>\n` +
     "⏱ تایم‌فریم: 15m\n" +
-    `📌 وضعیت: ${icon} <b>${label}</b>\n\n` +
-    `💰 قیمت فعلی: <b>${formatPrice(currentPrice)}</b>\n\n` +
+    `📌 وضعیت: ${icon} <b>${dirText}</b>\n\n` +
+    `💰 قیمت فعلی: <b>${fmtPrice(sig.currentPrice)}</b>\n\n` +
     "🎯 <b>Doji Setup فعال:</b>\n" +
-    `📌 نوع: <b>${directionText}</b>\n` +
-    `🎯 ورود: <b>${formatPrice(signal.entry)}</b>\n` +
-    `🛑 حد ضرر: <b>${formatPrice(signal.sl)}</b>\n` +
-    `📏 ریسک: <b>${formatPrice(signal.risk)}</b>\n\n` +
-    `🥇 TP: <b>${formatPrice(signal.tp)}</b> (2.00R)\n\n` +
-    `${statusIcon} <b>نتیجه: ${tradeStatusText}</b>\n` +
-    `🕯 زمان تأیید: ${formatTime(signal.confirmationTime)}\n\n` +
+    `📌 نوع: <b>${icon} ${dirText}</b>\n` +
+    `🎯 ورود: <b>${fmtPrice(sig.entry)}</b>\n` +
+    `🛑 حد ضرر: <b>${fmtPrice(sig.sl)}</b>\n` +
+    `📏 ریسک: <b>${fmtPrice(sig.risk)}</b>\n\n` +
+    `🥇 TP: <b>${fmtPrice(sig.tp)}</b> (2.00R)\n\n` +
+    `${statusIcon} <b>نتیجه: ${statusText}</b>\n` +
+    `🕯 زمان تأیید: ${fmtTime(sig.confirmationTime)}\n\n` +
     "━━━━━━━━━━━━━━━━━━━━━━\n" +
     "💡 مدیریت ریسک و سرمایه:\n" +
-    "🔸 با تاچ شدن TP، حد ضرر (Stop) را به نقطه ورود (Breakeven) منتقل کنید.\n" +
-    "🔸 در صورت نیاز به خروج زودهنگام، به ساختار بازار دقت کنید.\n" +
+    "🔸 با تاچ شدن TP، حد ضرر را به Breakeven منتقل کنید.\n" +
     "━━━━━━━━━━━━━━━━━━━━━━\n\n" +
     "⚠️ این خروجی تحلیل الگوریتمی است و تضمین سود نیست."
   );
 }
 
-async function sendTelegramMessage(token, chatId, text) {
+async function sendTelegram(token, chatId, text) {
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
-  const response = await fetch(url, {
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      parse_mode: "HTML",
-      disable_web_page_preview: true
-    })
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true }),
   });
-
-  const responseText = await response.text();
-  let data = null;
-  try { data = JSON.parse(responseText); } catch {}
-  if (!response.ok || !data || data.ok !== true) {
-    throw new Error(data?.description || `Telegram API error (HTTP ${response.status})`);
-  }
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.description || `Telegram error HTTP ${res.status}`);
 }
 
 async function main() {
@@ -439,7 +440,7 @@ async function main() {
   const chatId = process.env.TELEGRAM_CHAT_ID;
 
   if (!token || !chatId) {
-    console.error("❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID.");
+    console.error("❌ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID");
     process.exit(1);
   }
 
@@ -454,14 +455,20 @@ async function main() {
   }
 
   console.log(`📈 Fetched ${symbols.length} symbols to analyze.`);
+  if (symbols.length > 0) {
+    console.log(`   Top 5: ${symbols.slice(0, 5).map(s => s.symbol).join(", ")}`);
+  }
+  console.log("");
 
   let signalCount = 0;
 
-  for (const item of symbols) {
+  for (let i = 0; i < symbols.length; i++) {
     if (Date.now() - startTime > CONFIG.TOTAL_TIMEOUT_MS) {
-      console.log("⏱ Timeout reached, stopping early.");
+      console.log(`⏱ Timeout reached at symbol ${i + 1}/${symbols.length}`);
       break;
     }
+
+    const item = symbols[i];
 
     try {
       const candles = await getCandles(item.symbol, item.exchange);
@@ -470,16 +477,19 @@ async function main() {
       if (signal) {
         signalCount++;
         const text = formatSignal(item.symbol, signal);
-        await sendTelegramMessage(token, chatId, text);
-        console.log(`📤 Sent signal for ${item.symbol} (${signal.direction}).`);
+        await sendTelegram(token, chatId, text);
+        console.log(`📤 [${i + 1}/${symbols.length}] ${item.symbol} (${item.exchange}) → ${signal.direction} (${signal.tradeStatus})`);
+      } else {
+        console.log(`⚪ [${i + 1}/${symbols.length}] ${item.symbol} (${item.exchange}) → no doji`);
       }
     } catch (e) {
-      console.error(`⚠️ Error analyzing ${item.symbol}:`, e.message);
+      console.log(`⚠️ [${i + 1}/${symbols.length}] ${item.symbol} (${item.exchange}) → ${e.message}`);
     }
 
-    await new Promise(r => setTimeout(r, CONFIG.MESSAGE_DELAY_MS));
+    await sleep(CONFIG.MESSAGE_DELAY_MS);
   }
 
+  console.log("");
   console.log(`✅ Scan complete. Found and sent ${signalCount} signal(s).`);
   process.exit(0);
 }
