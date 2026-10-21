@@ -301,10 +301,6 @@ function dojiType(candle) {
   return null;
 }
 
-function isDoji(candle) {
-  return dojiType(candle) !== null;
-}
-
 function atrCalc(candles, period = 14) {
   if (!candles || candles.length < period + 1) return 0;
   const trs = [];
@@ -328,6 +324,10 @@ function analyzeSymbol(candles) {
 
   const lastConfirmIdx = candles.length - 1;
   const firstIndex = Math.max(2, candles.length - CONFIG.HISTORY_CANDLES - 1);
+
+  // محاسبه میانگین متحرک ۵۰ کندلی برای تشخیص روند کلی
+  const sma50Period = Math.min(50, candles.length);
+  const sma50 = candles.slice(-sma50Period).reduce((acc, c) => acc + c.close, 0) / sma50Period;
 
   for (let i = firstIndex; i < lastConfirmIdx; i++) {
     const doji = candles[i];
@@ -353,6 +353,14 @@ function analyzeSymbol(candles) {
     if (kind === "dragonfly" && direction !== "LONG") continue;
     if (kind === "gravestone" && direction !== "SHORT") continue;
 
+    // ==== فیلتر جدید ۱: فاصله تاییدیه از دوجی (جلوگیری از ورود دیرهنگام) ====
+    const gap = Math.abs(confirmation.close - doji.close);
+    if (gap > atrValue * 1.5) continue;
+
+    // ==== فیلتر جدید ۲: موقعیت نسبت به میانگین متحرک (فیلتر روند) ====
+    if (direction === "LONG" && doji.close > sma50 * 1.01) continue; 
+    if (direction === "SHORT" && doji.close < sma50 * 0.99) continue;
+
     let recentHigh = -Infinity, recentLow = Infinity;
     for (let j = Math.max(0, i - 100); j < i; j++) {
       if (candles[j].high > recentHigh) recentHigh = candles[j].high;
@@ -364,11 +372,15 @@ function analyzeSymbol(candles) {
     const range100 = recentHigh - recentLow;
     if (range100 <= 0) continue;
 
+    // ==== فیلتر جدید ۳: فاصله از سقف واقعی (جلوگیری از خرید در پامپ) ====
+    const distanceFromHigh = (recentHigh - doji.high) / range100;
+
     if (direction === "LONG") {
+      if (distanceFromHigh < 0.20) continue; // حداقل ۲۰٪ زیر سقف
       if (doji.low > recentLow + range100 * 0.35) continue;
-      if (doji.high > recentHigh * 0.998) continue;
       if (dojiMid > (recentHigh + recentLow) / 2) continue;
     } else {
+      if (distanceFromHigh < 0.20) continue; // برای شورت هم فاصله از سقف چک می‌شود
       if (doji.high < recentHigh - range100 * 0.35) continue;
       if (doji.low < recentLow * 1.002) continue;
       if (dojiMid < (recentHigh + recentLow) / 2) continue;
