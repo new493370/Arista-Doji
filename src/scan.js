@@ -19,10 +19,11 @@ const CONFIG = {
   MESSAGE_DELAY_MS: 1500,
   TOTAL_TIMEOUT_MS: 12 * 60 * 1000,
 
-  DOJI_MAX_BODY_RATIO: 0.03,
-  WICK_SYMMETRY_TOLERANCE: 0.3,
+  DOJI_MAX_BODY_RATIO: 0.10,
+  WICK_SYMMETRY_TOLERANCE: 0.05,
 
   SL_BUFFER_PERCENT: 0,
+  SL_ATR_MULTIPLIER: 0.5,
   MIN_RR: 1.5,
   MAX_RR: 4,
 
@@ -391,11 +392,8 @@ function getDojiType(candle) {
   const wickSum = upperWick + lowerWick;
   if (wickSum <= 0) return null;
 
-  const upperRatio = upperWick / range;
-  const lowerRatio = lowerWick / range;
+  if (upperWick === 0 || lowerWick === 0) return null;
 
-  if (upperRatio <= 0.05 && lowerRatio >= 0.60) return "dragonfly";
-  if (lowerRatio <= 0.05 && upperRatio >= 0.60) return "gravestone";
   if (Math.abs(upperWick - lowerWick) / wickSum <= CONFIG.WICK_SYMMETRY_TOLERANCE) return "standard";
 
   return null;
@@ -419,7 +417,6 @@ function calculateATR(candles, period = 14) {
 
 function applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation, atrValue, sma50) {
   const confirmationRange = confirmation.high - confirmation.low;
-  const dojiRange = doji.high - doji.low;
 
   if (CONFIG.USE_CONFIRMATION_ATR_FILTERS) {
     if (confirmationRange < atrValue * 0.5) return false;
@@ -435,8 +432,8 @@ function applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation
   }
 
   if (CONFIG.USE_SMA_FILTER) {
-    if (direction === "LONG" && doji.close > sma50 * 1.01) return false;
-    if (direction === "SHORT" && doji.close < sma50 * 0.99) return false;
+    if (direction === "LONG" && doji.close < sma50) return false;
+    if (direction === "SHORT" && doji.close > sma50) return false;
   }
 
   if (CONFIG.USE_RANGE_POSITION_FILTER) {
@@ -504,7 +501,8 @@ function analyzeSymbol(candles) {
   if (!passedFilters) return null;
 
   const entry = confirmation.close;
-  const buffer = dojiRange * CONFIG.SL_BUFFER_PERCENT;
+  
+  const buffer = Math.max(dojiRange * CONFIG.SL_BUFFER_PERCENT, atrValue * CONFIG.SL_ATR_MULTIPLIER);
   const sl = direction === "LONG" ? doji.low - buffer : doji.high + buffer;
   const risk = Math.abs(entry - sl);
 
@@ -574,12 +572,6 @@ function formatSignal(symbol, signal) {
   const directionIcon = isLong ? "🟢" : "🔴";
   const directionText = isLong ? "LONG" : "SHORT";
 
-  const kindLabels = {
-    dragonfly: "Dragonfly",
-    gravestone: "Gravestone",
-    standard: "Standard"
-  };
-
   const statusText = `معامله باز است (R فعلی: 0.00)`;
   const statusIcon = "⏳";
 
@@ -590,7 +582,7 @@ function formatSignal(symbol, signal) {
     `📌 وضعیت: ${directionIcon} <b>${directionText}</b>\n\n` +
     `💰 قیمت فعلی: <b>${fmtPrice(signal.currentPrice)}</b>\n\n` +
     "🎯 <b>Doji Setup فعال:</b>\n" +
-    `🕯 نوع دوجی: <b>${kindLabels[signal.kind]}</b>\n` +
+    `🕯 نوع دوجی: <b>Standard</b>\n` +
     `🎯 ورود: <b>${fmtPrice(signal.entry)}</b>\n` +
     `🛑 حد ضرر: <b>${fmtPrice(signal.sl)}</b>\n` +
     `📏 ریسک: <b>${fmtPrice(signal.risk)}</b>\n\n` +
