@@ -1,7 +1,7 @@
 const EXCHANGES = {
+  binance: { name: "Binance", base: "https://fapi1.binance.com" },
   okx: { name: "OKX", base: "https://www.okx.com" },
-  bybit: { name: "Bybit", base: "https://api.bybit.com" },
-  toobit: { name: "Toobit", base: "https://api.toobit.com" },
+  mexc: { name: "MEXC", base: "https://contract.mexc.com" },
 };
 
 const CONFIG = {
@@ -11,8 +11,8 @@ const CONFIG = {
   MIN_CANDLES_REQUIRED: 30,
 
   TOP_SYMBOL_COUNT: 9999999999,
-  MIN_QUOTE_VOLUME_24H: 5000,
-  ANALYSIS_ORDER: ["okx", "bybit", "toobit"],
+  MIN_QUOTE_VOLUME_24H: 500000,
+  ANALYSIS_ORDER: ["binance", "okx", "mexc"],
 
   API_MAX_RETRIES: 3,
   REQUEST_TIMEOUT_MS: 15000,
@@ -86,6 +86,16 @@ function createExchangeFetcher(baseUrl, exchangeName, validator) {
   };
 }
 
+const binanceFetch = createExchangeFetcher(
+  EXCHANGES.binance.base,
+  "Binance",
+  (json) => {
+    if (json == null || (Array.isArray(json) && json.length === 0)) {
+      throw new Error(`Binance: invalid or empty response`);
+    }
+  }
+);
+
 const okxFetch = createExchangeFetcher(
   EXCHANGES.okx.base,
   "OKX",
@@ -94,21 +104,42 @@ const okxFetch = createExchangeFetcher(
   }
 );
 
-const bybitFetch = createExchangeFetcher(
-  EXCHANGES.bybit.base,
-  "Bybit",
+const mexcFetch = createExchangeFetcher(
+  EXCHANGES.mexc.base,
+  "MEXC",
   (json) => {
-    if (!json || json.retCode !== 0) throw new Error(`Bybit: ${json?.retMsg || "unknown error"}`);
+    if (json == null || (json.success !== undefined && !json.success)) {
+      throw new Error(`MEXC: invalid response`);
+    }
   }
 );
 
-const toobitFetch = createExchangeFetcher(
-  EXCHANGES.toobit.base,
-  "Toobit",
-  (json) => {
-    if (json == null) throw new Error("Toobit: empty response");
-  }
-);
+async function fetchBinanceSymbols() {
+  const json = await binanceFetch("/fapi/v1/exchangeInfo");
+  return (json.symbols || [])
+    .filter(
+      (item) =>
+        item.status === "TRADING" &&
+        item.quoteAsset === "USDT" &&
+        item.contractType === "PERPETUAL"
+    )
+    .map((item) => ({
+      symbol: item.symbol,
+      base: item.baseAsset,
+      exchange: "binance",
+      raw: item.symbol,
+    }));
+}
+
+async function fetchBinanceTickers() {
+  const json = await binanceFetch("/fapi/v1/ticker/24hr");
+  return json
+    .filter((item) => item.symbol.endsWith("USDT"))
+    .map((item) => {
+      const volume = parseFloat(item.quoteVolume || "0");
+      return { symbol: item.symbol, volume: Number.isFinite(volume) ? volume : 0 };
+    });
+}
 
 async function fetchOKXSymbols() {
   const json = await okxFetch("/api/v5/public/instruments", { instType: "SWAP" });
@@ -137,83 +168,40 @@ async function fetchOKXTickers() {
     });
 }
 
-async function fetchBybitSymbols() {
-  const all = [];
-  let cursor = "";
-
-  for (let page = 0; page < 10; page++) {
-    const params = { category: "linear", limit: "1000" };
-    if (cursor) params.cursor = cursor;
-
-    const json = await bybitFetch("/v5/market/instruments-info", params);
-    const rows = json.result?.list || [];
-    all.push(...rows);
-
-    cursor = json.result?.nextPageCursor || "";
-    if (!cursor || rows.length === 0) break;
-  }
-
-  return all
+async function fetchMEXCSymbols() {
+  const json = await mexcFetch("/api/v1/contract/detail");
+  return (json.data || [])
     .filter(
       (item) =>
-        item.status === "Trading" &&
+        item.state === 0 &&
         item.quoteCoin === "USDT" &&
-        item.contractType === "LinearPerpetual"
+        item.settleCoin === "USDT"
     )
     .map((item) => ({
       symbol: item.symbol,
       base: item.baseCoin,
-      exchange: "bybit",
+      exchange: "mexc",
       raw: item.symbol,
     }));
 }
 
-async function fetchBybitTickers() {
-  const json = await bybitFetch("/v5/market/tickers", { category: "linear" });
-  return (json.result?.list || [])
-    .filter((item) => item.symbol.endsWith("USDT"))
+async function fetchMEXCTickers() {
+  const json = await mexcFetch("/api/v1/contract/ticker");
+  return (json.data || [])
+    .filter((item) => item.symbol.endsWith("_USDT"))
     .map((item) => {
-      const volume = parseFloat(item.turnover24h || "0");
-      return { symbol: item.symbol, volume: Number.isFinite(volume) ? volume : 0 };
+      const symbol = item.symbol.replace("_USDT", "USDT");
+      const volume = parseFloat(item.amount24 || "0");
+      return { symbol, volume: Number.isFinite(volume) ? volume : 0 };
     });
-}
-
-async function fetchToobitSymbols() {
-  const json = await toobitFetch("/api/v1/exchangeInfo");
-  return (json.contracts || [])
-    .filter(
-      (item) =>
-        item.status === "TRADING" &&
-        item.inverse === false &&
-        String(item.symbol || "").endsWith("-SWAP-USDT")
-    )
-    .map((item) => {
-      const raw = item.symbol;
-      const base = item.underlying || raw.split("-")[0];
-      return { symbol: `${base}USDT`, base, exchange: "toobit", raw };
-    });
-}
-
-async function fetchToobitTickers() {
-  const json = await toobitFetch("/quote/v1/contract/ticker/24hr");
-  const rows = Array.isArray(json) ? json : json?.data || json?.result || [];
-
-  return rows
-    .map((item) => {
-      const raw = String(item.s || item.symbol || "");
-      const normalized = raw.replace("-SWAP-USDT", "USDT");
-      const volume = parseFloat(item.qv || item.quoteVolume || item.volume || "0");
-      return { symbol: normalized, volume: Number.isFinite(volume) ? volume : 0 };
-    })
-    .filter((item) => item.symbol && item.volume > 0);
 }
 
 async function getTopSymbols() {
   const allCandidates = [];
   const exchangeSources = [
+    { name: "binance", fetchSymbols: fetchBinanceSymbols, fetchTickers: fetchBinanceTickers },
     { name: "okx", fetchSymbols: fetchOKXSymbols, fetchTickers: fetchOKXTickers },
-    { name: "bybit", fetchSymbols: fetchBybitSymbols, fetchTickers: fetchBybitTickers },
-    { name: "toobit", fetchSymbols: fetchToobitSymbols, fetchTickers: fetchToobitTickers },
+    { name: "mexc", fetchSymbols: fetchMEXCSymbols, fetchTickers: fetchMEXCTickers },
   ];
 
   const orderedSources = CONFIG.ANALYSIS_ORDER
@@ -288,7 +276,22 @@ async function getCandles(symbol, exchange) {
     try {
       let candles = [];
 
-      if (currentExchange === "okx") {
+      if (currentExchange === "binance") {
+        const json = await binanceFetch("/fapi/v1/klines", {
+          symbol,
+          interval: CONFIG.TIMEFRAME,
+          limit: String(CONFIG.FETCH_CANDLES),
+        });
+        if (!Array.isArray(json)) throw new Error("Invalid Binance candle response");
+        candles = json.map((row) => ({
+          time: Number(row[0]),
+          open: Number(row[1]),
+          high: Number(row[2]),
+          low: Number(row[3]),
+          close: Number(row[4]),
+          closed: Number(row[6]) <= Date.now(),
+        }));
+      } else if (currentExchange === "okx") {
         const json = await okxFetch("/api/v5/market/candles", {
           instId: `${base}-USDT-SWAP`,
           bar: CONFIG.TIMEFRAME,
@@ -303,55 +306,21 @@ async function getCandles(symbol, exchange) {
           close: Number(row[4]),
           closed: row[8] === "1",
         }));
-      } else if (currentExchange === "bybit") {
-        const json = await bybitFetch("/v5/market/kline", {
-          category: "linear",
-          symbol,
-          interval: "15",
-          limit: String(CONFIG.FETCH_CANDLES),
+      } else if (currentExchange === "mexc") {
+        const json = await mexcFetch("/api/v1/contract/kline/" + symbol, {
+          interval: "Min15",
         });
-        if (!Array.isArray(json.result?.list)) throw new Error("Invalid Bybit candle response");
-        candles = json.result.list.map((row) => ({
-          time: Number(row[0]),
-          open: Number(row[1]),
-          high: Number(row[2]),
-          low: Number(row[3]),
-          close: Number(row[4]),
-          closed: Number(row[0]) + CONFIG.INTERVAL_MS <= Date.now(),
+        if (!json.data || !Array.isArray(json.data.time)) throw new Error("Invalid MEXC candle response");
+        
+        const { time, open, high, low, close } = json.data;
+        candles = time.map((t, i) => ({
+          time: Number(t) * 1000,
+          open: Number(open[i]),
+          high: Number(high[i]),
+          low: Number(low[i]),
+          close: Number(close[i]),
+          closed: (Number(t) * 1000) + CONFIG.INTERVAL_MS <= Date.now(),
         }));
-      } else if (currentExchange === "toobit") {
-        const json = await toobitFetch("/quote/v1/klines", {
-          symbol: `${base}-SWAP-USDT`,
-          interval: CONFIG.TIMEFRAME,
-          limit: String(CONFIG.FETCH_CANDLES),
-        });
-        const rows = Array.isArray(json) ? json : json?.data || json?.result || [];
-        if (!Array.isArray(rows)) throw new Error("Invalid Toobit candle response");
-
-        candles = rows.map((row) => {
-          if (Array.isArray(row)) {
-            const time = Number(row[0]);
-            const closeTime = Number(row[6]);
-            return {
-              time,
-              open: Number(row[1]),
-              high: Number(row[2]),
-              low: Number(row[3]),
-              close: Number(row[4]),
-              closed: (Number.isFinite(closeTime) && closeTime > time ? closeTime : time + CONFIG.INTERVAL_MS) <= Date.now(),
-            };
-          }
-          const time = Number(row.time ?? row.t ?? row.openTime);
-          const closeTime = Number(row.closeTime ?? row.T ?? (time + CONFIG.INTERVAL_MS));
-          return {
-            time,
-            open: Number(row.open ?? row.o),
-            high: Number(row.high ?? row.h),
-            low: Number(row.low ?? row.l),
-            close: Number(row.close ?? row.c),
-            closed: closeTime <= Date.now(),
-          };
-        });
       }
 
       candles.sort((a, b) => a.time - b.time);
