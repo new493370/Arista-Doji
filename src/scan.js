@@ -20,8 +20,9 @@ const CONFIG = {
 
   API_MAX_RETRIES: 3,
   REQUEST_TIMEOUT_MS: 15000,
-  MESSAGE_DELAY_MS: 500,
+  MESSAGE_DELAY_MS: 300,
   TOTAL_TIMEOUT_MS: 12 * 60 * 1000,
+  CONCURRENCY: 5,
 
   DOJI_MAX_BODY_RATIO: 0.10,
   WICK_SYMMETRY_TOLERANCE: 0.15,
@@ -35,6 +36,9 @@ const CONFIG = {
   USE_SMA_FILTER: true,
   USE_RANGE_POSITION_FILTER: true,
 };
+
+const klineCache = {};
+const KLINE_CACHE_TTL_MS = 15 * 1000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -173,10 +177,7 @@ async function getTopSymbols() {
   for (const exchange of orderedSources) {
     try {
       const [symbols, tickers] = await Promise.all([exchange.fetchSymbols(), exchange.fetchTickers()]);
-      if (!symbols || symbols.length === 0) {
-        console.log(`[${exchange.name}] No symbols returned.`);
-        continue;
-      }
+      if (!symbols || symbols.length === 0) continue;
 
       const volumeMap = new Map(tickers.map((t) => [t.symbol, t.volume]));
       const ranked = symbols
@@ -184,11 +185,8 @@ async function getTopSymbols() {
         .filter((s) => s.volume >= CONFIG.MIN_QUOTE_VOLUME_24H)
         .sort((a, b) => b.volume - a.volume);
 
-      console.log(`[${exchange.name}] Found ${symbols.length} symbols, ${ranked.length} passed volume filter (>= ${CONFIG.MIN_QUOTE_VOLUME_24H.toLocaleString()}).`);
       allCandidates.push(...ranked);
-    } catch (error) {
-      console.error(`[${exchange.name}] Error fetching symbols: ${error.message}`);
-    }
+    } catch (error) {}
   }
 
   if (allCandidates.length === 0) throw new Error("No symbols passed volume filter.");
@@ -206,12 +204,6 @@ function isValidCandle(c) {
   return Number.isFinite(c.time) && Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close) && c.high >= c.low && c.high >= Math.max(c.open, c.close) && c.low <= Math.min(c.open, c.close) && c.low > 0;
 }
 
-function getBybitInterval(tf) {
-  if (tf === "1h") return "60";
-  if (tf === "30m") return "30";
-  return "15";
-}
-
 function getMexcInterval(tf) {
   if (tf === "1h") return "Min60";
   if (tf === "30m") return "Min30";
@@ -219,6 +211,13 @@ function getMexcInterval(tf) {
 }
 
 async function getCandles(symbol, exchange, timeframe) {
+  const cacheKey = `${symbol}:${exchange}:${timeframe}`;
+  const cached = klineCache[cacheKey];
+
+  if (cached && Date.now() - cached.time < KLINE_CACHE_TTL_MS) {
+    return cached.candles;
+  }
+
   const base = symbol.replace(/USDT$/, "");
   const exchangesToTry = [exchange, ...CONFIG.ANALYSIS_ORDER.filter((e) => e !== exchange)];
   let lastError = null;
@@ -251,7 +250,11 @@ async function getCandles(symbol, exchange, timeframe) {
         if (!seen.has(c.time)) { seen.add(c.time); unique.push(c); }
       }
 
-      if (unique.length >= CONFIG.MIN_CANDLES_REQUIRED) return unique.slice(-CONFIG.FETCH_CANDLES);
+      if (unique.length >= CONFIG.MIN_CANDLES_REQUIRED) {
+        const result = unique.slice(-CONFIG.FETCH_CANDLES);
+        klineCache[cacheKey] = { time: Date.now(), candles: result };
+        return result;
+      }
       throw new Error(`Only ${unique.length} candles`);
     } catch (error) {
       lastError = error;
@@ -508,13 +511,39 @@ async function sendTelegram(token, chatId, message) {
   if (!res.ok || !data?.ok) throw new Error(data?.description || `Telegram error`);
 }
 
+async function runWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function runner() {
+    while (true) {
+      const currentIndex = nextIndex++;
+      if (currentIndex >= items.length) return;
+      try {
+        results[currentIndex] = await worker(items[currentIndex], currentIndex);
+      } catch (e) {
+        results[currentIndex] = { error: e };
+      }
+    }
+  }
+
+  const runners = [];
+  for (let i = 0; i < Math.min(concurrency, items.length); i++) {
+    runners.push(runner());
+  }
+
+  await Promise.all(runners);
+  return results;
+}
+
 async function checkOpenTrades(openTrades, token, chatId) {
   if (openTrades.length === 0) return [];
   
   console.log(`Checking ${openTrades.length} open trades...`);
-  const remainingTrades = [];
-
-  for (const trade of openTrades) {
+  
+  const tasks = openTrades.map((trade) => ({ trade }));
+  
+  const results = await runWithConcurrency(tasks, CONFIG.CONCURRENCY, async ({ trade }) => {
     try {
       const candles = await getCandles(trade.symbol, trade.exchange, trade.timeframe);
       
@@ -561,14 +590,31 @@ async function checkOpenTrades(openTrades, token, chatId) {
 
       if (closedStatus) {
         trade.status = closedStatus;
-        const message = formatTradeClosed(trade);
-        await sendTelegram(token, chatId, message);
-        console.log(`Trade closed: ${trade.symbol} (${trade.timeframe}) -> ${closedStatus}`);
+        return { trade, closedStatus };
       } else {
-        remainingTrades.push(trade);
+        return { trade, closedStatus: null };
       }
     } catch (error) {
       console.error(`Failed to check ${trade.symbol}: ${error.message}`);
+      return { trade, closedStatus: null };
+    }
+  });
+
+  const remainingTrades = [];
+
+  for (const result of results) {
+    if (!result) continue;
+    const { trade, closedStatus } = result;
+
+    if (closedStatus) {
+      const message = formatTradeClosed(trade);
+      try {
+        await sendTelegram(token, chatId, message);
+        console.log(`Trade closed: ${trade.symbol} (${trade.timeframe}) -> ${closedStatus}`);
+      } catch (e) {
+        console.error(`Failed to send closure msg for ${trade.symbol}: ${e.message}`);
+      }
+    } else {
       remainingTrades.push(trade);
     }
   }
@@ -602,74 +648,87 @@ async function main() {
 
   console.log(`Fetched ${symbols.length} symbols to analyze.`);
 
+  const tasks = [];
+  for (const item of symbols) {
+    tasks.push({ item });
+  }
+
   let signalCount = 0;
 
-  for (let i = 0; i < symbols.length; i++) {
+  const scanResults = await runWithConcurrency(tasks, CONFIG.CONCURRENCY, async ({ item }) => {
     if (Date.now() - startTime > CONFIG.TOTAL_TIMEOUT_MS) {
-      console.log(`Timeout reached at symbol ${i + 1}/${symbols.length}`);
-      break;
+      return { item, status: "timeout" };
     }
 
-    const item = symbols[i];
-    
     const existingTrades = openTrades.filter(t => t.symbol === item.symbol);
     const existingTrade = existingTrades.length > 0 ? existingTrades[0] : null;
 
-    let signalFound = false;
-
     for (const tf of CONFIG.TIMEFRAMES) {
-      if (signalFound) break;
-
       try {
         const candles = await getCandles(item.symbol, item.exchange, tf);
         const signal = analyzeSymbol(candles);
 
         if (signal) {
           const isSameDirection = existingTrade && existingTrade.direction === signal.direction;
-          
+
           if (existingTrade && !isSameDirection) {
-            const warning = formatReversalWarning(item.symbol, existingTrade, signal, tf);
-            const newSignalMsg = formatSignal(item.symbol, signal, tf);
-            await sendTelegram(token, chatId, warning + newSignalMsg);
-            console.log(`⚠️ Reversal on ${item.symbol} (${tf}): ${existingTrade.direction} -> ${signal.direction}`);
-            
-            openTrades = openTrades.filter(t => t.symbol !== item.symbol);
-            openTrades.push({
-              symbol: item.symbol,
-              exchange: item.exchange,
-              timeframe: tf,
-              direction: signal.direction,
-              entry: signal.entry,
-              sl: signal.sl,
-              tp: signal.tp,
-              confirmationTime: signal.confirmationTime,
-              status: "OPEN"
-            });
-            signalCount++;
-            signalFound = true;
+            return { item, tf, signal, existingTrade, type: "reversal" };
           } else if (!existingTrade) {
-            signalCount++;
-            const message = formatSignal(item.symbol, signal, tf);
-            await sendTelegram(token, chatId, message);
-            console.log(`[${i + 1}/${symbols.length}] ${item.symbol} (${item.exchange}) [${tf}] -> ${signal.direction}`);
-            
-            openTrades.push({
-              symbol: item.symbol,
-              exchange: item.exchange,
-              timeframe: tf,
-              direction: signal.direction,
-              entry: signal.entry,
-              sl: signal.sl,
-              tp: signal.tp,
-              confirmationTime: signal.confirmationTime,
-              status: "OPEN"
-            });
-            signalFound = true;
+            return { item, tf, signal, existingTrade: null, type: "new" };
           }
         }
       } catch (error) {}
+    }
+
+    return { item, status: "no_signal" };
+  });
+
+  for (const result of scanResults) {
+    if (!result) continue;
+
+    if (result.type === "reversal") {
+      const { item, tf, signal, existingTrade } = result;
+      const warning = formatReversalWarning(item.symbol, existingTrade, signal, tf);
+      const newSignalMsg = formatSignal(item.symbol, signal, tf);
       
-      await sleep(200);
+      try {
+        await sendTelegram(token, chatId, warning + newSignalMsg);
+        console.log(`⚠️ Reversal on ${item.symbol} (${tf}): ${existingTrade.direction} -> ${signal.direction}`);
+        
+        openTrades = openTrades.filter(t => t.symbol !== item.symbol);
+        openTrades.push({
+          symbol: item.symbol,
+          exchange: item.exchange,
+          timeframe: tf,
+          direction: signal.direction,
+          entry: signal.entry,
+          sl: signal.sl,
+          tp: signal.tp,
+          confirmationTime: signal.confirmationTime,
+          status: "OPEN"
+        });
+        signalCount++;
+      } catch (e) {}
+    } else if (result.type === "new") {
+      const { item, tf, signal } = result;
+      try {
+        signalCount++;
+        const message = formatSignal(item.symbol, signal, tf);
+        await sendTelegram(token, chatId, message);
+        console.log(`[${signalCount}] ${item.symbol} (${item.exchange}) [${tf}] -> ${signal.direction}`);
+        
+        openTrades.push({
+          symbol: item.symbol,
+          exchange: item.exchange,
+          timeframe: tf,
+          direction: signal.direction,
+          entry: signal.entry,
+          sl: signal.sl,
+          tp: signal.tp,
+          confirmationTime: signal.confirmationTime,
+          status: "OPEN"
+        });
+      } catch (e) {}
     }
   }
 
