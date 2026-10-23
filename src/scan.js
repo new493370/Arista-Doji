@@ -173,7 +173,10 @@ async function getTopSymbols() {
   for (const exchange of orderedSources) {
     try {
       const [symbols, tickers] = await Promise.all([exchange.fetchSymbols(), exchange.fetchTickers()]);
-      if (!symbols || symbols.length === 0) continue;
+      if (!symbols || symbols.length === 0) {
+        console.log(`[${exchange.name}] No symbols returned.`);
+        continue;
+      }
 
       const volumeMap = new Map(tickers.map((t) => [t.symbol, t.volume]));
       const ranked = symbols
@@ -181,11 +184,14 @@ async function getTopSymbols() {
         .filter((s) => s.volume >= CONFIG.MIN_QUOTE_VOLUME_24H)
         .sort((a, b) => b.volume - a.volume);
 
+      console.log(`[${exchange.name}] Found ${symbols.length} symbols, ${ranked.length} passed volume filter (>= ${CONFIG.MIN_QUOTE_VOLUME_24H.toLocaleString()}).`);
       allCandidates.push(...ranked);
-    } catch (error) {}
+    } catch (error) {
+      console.error(`[${exchange.name}] Error fetching symbols: ${error.message}`);
+    }
   }
 
-  if (allCandidates.length === 0) throw new Error("No symbols");
+  if (allCandidates.length === 0) throw new Error("No symbols passed volume filter.");
 
   const uniqueMap = new Map();
   for (const item of allCandidates) {
@@ -665,8 +671,6 @@ async function main() {
       
       await sleep(200);
     }
-
-    await sleep(CONFIG.MESSAGE_DELAY_MS);
   }
 
   saveTrades(openTrades);
