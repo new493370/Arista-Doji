@@ -15,7 +15,7 @@ const CONFIG = {
   TRADES_FILE: path.resolve('src', 'trades.json'),
 
   TOP_SYMBOL_COUNT: 9999999999,
-  MIN_QUOTE_VOLUME_24H: 100000000,
+  MIN_QUOTE_VOLUME_24H: 20000000,
   ANALYSIS_ORDER: ["binance", "okx", "mexc"],
 
   API_MAX_RETRIES: 3,
@@ -26,6 +26,7 @@ const CONFIG = {
 
   DOJI_MAX_BODY_RATIO: 0.10,
   WICK_SYMMETRY_TOLERANCE: 0.15,
+  CONFIRMATION_MIN_BODY_RATIO: 0.30,
 
   SL_BUFFER_PERCENT: 0,
   SL_ATR_MULTIPLIER: 1.2,
@@ -293,10 +294,13 @@ function calculateATR(candles, period = 14) {
 
 function applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation, atrValue, sma50) {
   const confirmationRange = confirmation.high - confirmation.low;
+  const confirmationBody = Math.abs(confirmation.close - confirmation.open);
+  const dojiRange = doji.high - doji.low;
+
+  if (confirmationBody < dojiRange * CONFIG.CONFIRMATION_MIN_BODY_RATIO) return false;
 
   if (CONFIG.USE_CONFIRMATION_ATR_FILTERS) {
     if (confirmationRange < atrValue * 0.5) return false;
-    const confirmationBody = Math.abs(confirmation.close - confirmation.open);
     if (confirmationBody < atrValue * 0.3) return false;
     const breakoutDistance = direction === "LONG" ? confirmation.close - doji.high : doji.low - confirmation.close;
     if (breakoutDistance > atrValue * 1.5) return false;
