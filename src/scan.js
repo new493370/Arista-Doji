@@ -8,19 +8,19 @@ const EXCHANGES = {
 };
 
 const CONFIG = {
-  TIMEFRAME: "15m",
-  INTERVAL_MS: 15 * 60 * 1000,
+  TIMEFRAMES: ["1h", "30m", "15m"],
+  INTERVAL_MS: { "15m": 15 * 60 * 1000, "30m": 30 * 60 * 1000, "1h": 60 * 60 * 1000 },
   FETCH_CANDLES: 130,
   MIN_CANDLES_REQUIRED: 30,
   TRADES_FILE: path.resolve('src', 'trades.json'),
 
   TOP_SYMBOL_COUNT: 9999999999,
-  MIN_QUOTE_VOLUME_24H: 500000,
+  MIN_QUOTE_VOLUME_24H: 100000000,
   ANALYSIS_ORDER: ["binance", "okx", "mexc"],
 
   API_MAX_RETRIES: 3,
   REQUEST_TIMEOUT_MS: 15000,
-  MESSAGE_DELAY_MS: 1500,
+  MESSAGE_DELAY_MS: 500,
   TOTAL_TIMEOUT_MS: 12 * 60 * 1000,
 
   DOJI_MAX_BODY_RATIO: 0.10,
@@ -200,7 +200,19 @@ function isValidCandle(c) {
   return Number.isFinite(c.time) && Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close) && c.high >= c.low && c.high >= Math.max(c.open, c.close) && c.low <= Math.min(c.open, c.close) && c.low > 0;
 }
 
-async function getCandles(symbol, exchange) {
+function getBybitInterval(tf) {
+  if (tf === "1h") return "60";
+  if (tf === "30m") return "30";
+  return "15";
+}
+
+function getMexcInterval(tf) {
+  if (tf === "1h") return "Min60";
+  if (tf === "30m") return "Min30";
+  return "Min15";
+}
+
+async function getCandles(symbol, exchange, timeframe) {
   const base = symbol.replace(/USDT$/, "");
   const exchangesToTry = [exchange, ...CONFIG.ANALYSIS_ORDER.filter((e) => e !== exchange)];
   let lastError = null;
@@ -208,20 +220,21 @@ async function getCandles(symbol, exchange) {
   for (const currentExchange of exchangesToTry) {
     try {
       let candles = [];
+      const intervalMs = CONFIG.INTERVAL_MS[timeframe];
 
       if (currentExchange === "binance") {
-        const json = await binanceFetch("/fapi/v1/klines", { symbol, interval: CONFIG.TIMEFRAME, limit: String(CONFIG.FETCH_CANDLES) });
+        const json = await binanceFetch("/fapi/v1/klines", { symbol, interval: timeframe, limit: String(CONFIG.FETCH_CANDLES) });
         if (!Array.isArray(json)) throw new Error("Invalid Binance");
         candles = json.map((row) => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), closed: Number(row[6]) <= Date.now() }));
       } else if (currentExchange === "okx") {
-        const json = await okxFetch("/api/v5/market/candles", { instId: `${base}-USDT-SWAP`, bar: CONFIG.TIMEFRAME, limit: String(CONFIG.FETCH_CANDLES) });
+        const json = await okxFetch("/api/v5/market/candles", { instId: `${base}-USDT-SWAP`, bar: timeframe, limit: String(CONFIG.FETCH_CANDLES) });
         if (!Array.isArray(json.data)) throw new Error("Invalid OKX");
-        candles = json.data.map((row) => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), closed: (Number(row[0]) + CONFIG.INTERVAL_MS) <= Date.now() }));
+        candles = json.data.map((row) => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), closed: (Number(row[0]) + intervalMs) <= Date.now() }));
       } else if (currentExchange === "mexc") {
-        const json = await mexcFetch("/api/v1/contract/kline/" + symbol, { interval: "Min15" });
+        const json = await mexcFetch("/api/v1/contract/kline/" + symbol, { interval: getMexcInterval(timeframe) });
         if (!json.data || !Array.isArray(json.data.time)) throw new Error("Invalid MEXC");
         const { time, open, high, low, close } = json.data;
-        candles = time.map((t, i) => ({ time: Number(t) * 1000, open: Number(open[i]), high: Number(high[i]), low: Number(low[i]), close: Number(close[i]), closed: (Number(t) * 1000) + CONFIG.INTERVAL_MS <= Date.now() }));
+        candles = time.map((t, i) => ({ time: Number(t) * 1000, open: Number(open[i]), high: Number(high[i]), low: Number(low[i]), close: Number(close[i]), closed: (Number(t) * 1000) + intervalMs <= Date.now() }));
       }
 
       candles.sort((a, b) => a.time - b.time);
@@ -408,7 +421,7 @@ function calcProfitPercent(entry, targetPrice) {
   return Math.abs((targetPrice - entry) / entry) * 100;
 }
 
-function formatSignal(symbol, signal) {
+function formatSignal(symbol, signal, timeframe) {
   const isLong = signal.direction === "LONG";
   const dIcon = isLong ? "🟢" : "🔴";
   const dText = isLong ? "LONG" : "SHORT";
@@ -416,7 +429,7 @@ function formatSignal(symbol, signal) {
   return (
     "📊 <b>تحلیل Doji</b>\n\n" +
     `${dIcon} <b>${escapeHtml(symbol)}</b>\n` +
-    `⏱ تایم‌فریم: ${CONFIG.TIMEFRAME}\n` +
+    `⏱ تایم‌فریم: ${timeframe}\n` +
     `📌 وضعیت: ${dIcon} <b>${dText}</b>\n\n` +
     `💰 قیمت فعلی: <b>${fmtPrice(signal.currentPrice)}</b>\n\n` +
     "🎯 <b>Doji Setup فعال:</b>\n" +
@@ -454,13 +467,27 @@ function formatTradeClosed(trade) {
     title + "\n" +
     "━━━━━━━━━━━━━━━━━━━━━━\n" +
     `🔸 ارز: <b>${escapeHtml(trade.symbol)}</b>\n` +
-    `⏱ تایم‌فریم: ${CONFIG.TIMEFRAME}\n` +
+    `⏱ تایم‌فریم: ${trade.timeframe}\n` +
     `📌 جهت: ${dIcon} <b>${dText}</b>\n\n` +
     `${reasonText}\n` +
     `💰 سود/ضرر خالص (بدون اهرم): <b>${profitColor} ${profitSign}${profitPct.toFixed(2)}%</b>\n\n` +
     `🎯 ورود: <b>${fmtPrice(trade.entry)}</b>\n` +
     `🏁 خروج: <b>${fmtPrice(hitPrice)}</b>\n\n` +
     "💡 مدیریت سرمایه را رعایت کنید. منتظر سیگنال بعدی باشید."
+  );
+}
+
+function formatReversalWarning(symbol, oldTrade, newSignal, timeframe) {
+  const oldDir = oldTrade.direction === "LONG" ? "🟢 LONG" : "🔴 SHORT";
+  const newDir = newSignal.direction === "LONG" ? "🟢 LONG" : "🔴 SHORT";
+  return (
+    "⚠️ <b>هشدار تغییر روند!</b>\n\n" +
+    `🔸 ارز: <b>${escapeHtml(symbol)}</b>\n` +
+    `⏱ تایم‌فریم: ${timeframe}\n\n` +
+    `❌ معامله قبلی شما (${oldDir}) هنوز باز است.\n` +
+    `🔄 سیگنال جدید مخالف (${newDir}) شناسایی شد.\n\n` +
+    "💡 <b>پیشنهاد:</b> لطفاً معامله قبلی را ببندید و در صورت تمایل معامله جدید را باز کنید.\n\n" +
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
   );
 }
 
@@ -483,7 +510,7 @@ async function checkOpenTrades(openTrades, token, chatId) {
 
   for (const trade of openTrades) {
     try {
-      const candles = await getCandles(trade.symbol, trade.exchange);
+      const candles = await getCandles(trade.symbol, trade.exchange, trade.timeframe);
       
       const sentTime = Number(trade.confirmationTime);
       const signalCandles = candles.filter(c => c.time >= sentTime);
@@ -530,7 +557,7 @@ async function checkOpenTrades(openTrades, token, chatId) {
         trade.status = closedStatus;
         const message = formatTradeClosed(trade);
         await sendTelegram(token, chatId, message);
-        console.log(`Trade closed: ${trade.symbol} -> ${closedStatus}`);
+        console.log(`Trade closed: ${trade.symbol} (${trade.timeframe}) -> ${closedStatus}`);
       } else {
         remainingTrades.push(trade);
       }
@@ -570,7 +597,6 @@ async function main() {
   console.log(`Fetched ${symbols.length} symbols to analyze.`);
 
   let signalCount = 0;
-  const openTradeSymbols = new Set(openTrades.map(t => t.symbol));
 
   for (let i = 0; i < symbols.length; i++) {
     if (Date.now() - startTime > CONFIG.TOTAL_TIMEOUT_MS) {
@@ -579,33 +605,66 @@ async function main() {
     }
 
     const item = symbols[i];
+    
+    const existingTrades = openTrades.filter(t => t.symbol === item.symbol);
+    const existingTrade = existingTrades.length > 0 ? existingTrades[0] : null;
 
-    if (openTradeSymbols.has(item.symbol)) {
-      continue;
+    let signalFound = false;
+
+    for (const tf of CONFIG.TIMEFRAMES) {
+      if (signalFound) break;
+
+      try {
+        const candles = await getCandles(item.symbol, item.exchange, tf);
+        const signal = analyzeSymbol(candles);
+
+        if (signal) {
+          const isSameDirection = existingTrade && existingTrade.direction === signal.direction;
+          
+          if (existingTrade && !isSameDirection) {
+            const warning = formatReversalWarning(item.symbol, existingTrade, signal, tf);
+            const newSignalMsg = formatSignal(item.symbol, signal, tf);
+            await sendTelegram(token, chatId, warning + newSignalMsg);
+            console.log(`⚠️ Reversal on ${item.symbol} (${tf}): ${existingTrade.direction} -> ${signal.direction}`);
+            
+            openTrades = openTrades.filter(t => t.symbol !== item.symbol);
+            openTrades.push({
+              symbol: item.symbol,
+              exchange: item.exchange,
+              timeframe: tf,
+              direction: signal.direction,
+              entry: signal.entry,
+              sl: signal.sl,
+              tp: signal.tp,
+              confirmationTime: signal.confirmationTime,
+              status: "OPEN"
+            });
+            signalCount++;
+            signalFound = true;
+          } else if (!existingTrade) {
+            signalCount++;
+            const message = formatSignal(item.symbol, signal, tf);
+            await sendTelegram(token, chatId, message);
+            console.log(`[${i + 1}/${symbols.length}] ${item.symbol} (${item.exchange}) [${tf}] -> ${signal.direction}`);
+            
+            openTrades.push({
+              symbol: item.symbol,
+              exchange: item.exchange,
+              timeframe: tf,
+              direction: signal.direction,
+              entry: signal.entry,
+              sl: signal.sl,
+              tp: signal.tp,
+              confirmationTime: signal.confirmationTime,
+              status: "OPEN"
+            });
+            signalFound = true;
+          }
+        }
+      } catch (error) {}
+      
+      await sleep(200);
     }
-
-    try {
-      const candles = await getCandles(item.symbol, item.exchange);
-      const signal = analyzeSymbol(candles);
-
-      if (signal) {
-        signalCount++;
-        const message = formatSignal(item.symbol, signal);
-        await sendTelegram(token, chatId, message);
-        console.log(`[${i + 1}/${symbols.length}] ${item.symbol} (${item.exchange}) -> ${signal.direction}`);
-        
-        openTrades.push({
-          symbol: item.symbol,
-          exchange: item.exchange,
-          direction: signal.direction,
-          entry: signal.entry,
-          sl: signal.sl,
-          tp: signal.tp,
-          confirmationTime: signal.confirmationTime,
-          status: "OPEN"
-        });
-      }
-    } catch (error) {}
 
     await sleep(CONFIG.MESSAGE_DELAY_MS);
   }
