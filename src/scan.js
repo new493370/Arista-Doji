@@ -216,7 +216,7 @@ async function getCandles(symbol, exchange) {
       } else if (currentExchange === "okx") {
         const json = await okxFetch("/api/v5/market/candles", { instId: `${base}-USDT-SWAP`, bar: CONFIG.TIMEFRAME, limit: String(CONFIG.FETCH_CANDLES) });
         if (!Array.isArray(json.data)) throw new Error("Invalid OKX");
-        candles = json.data.map((row) => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), closed: row[8] === "1" }));
+        candles = json.data.map((row) => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), closed: (Number(row[0]) + CONFIG.INTERVAL_MS) <= Date.now() }));
       } else if (currentExchange === "mexc") {
         const json = await mexcFetch("/api/v1/contract/kline/" + symbol, { interval: "Min15" });
         if (!json.data || !Array.isArray(json.data.time)) throw new Error("Invalid MEXC");
@@ -484,17 +484,46 @@ async function checkOpenTrades(openTrades, token, chatId) {
   for (const trade of openTrades) {
     try {
       const candles = await getCandles(trade.symbol, trade.exchange);
-      const relevantCandles = candles.filter(c => c.time > trade.confirmationTime);
-      let closedStatus = null;
+      
+      const sentTime = Number(trade.confirmationTime);
+      const signalCandles = candles.filter(c => c.time >= sentTime);
+      
+      if (signalCandles.length === 0 && candles.length > 0) {
+        signalCandles.push(candles[candles.length - 1]);
+      }
 
-      for (const c of relevantCandles) {
+      let stopHit = false;
+      let tpHit = false;
+      let stopIndex = -1;
+      let tpIndex = -1;
+
+      for (let i = 0; i < signalCandles.length; i++) {
+        const c = signalCandles[i];
         if (trade.direction === "LONG") {
-          if (c.low <= trade.sl) { closedStatus = "SL_HIT"; break; }
-          if (c.high >= trade.tp) { closedStatus = "TP_HIT"; break; }
+          if (Number.isFinite(c.low) && c.low <= trade.sl && stopIndex === -1) { stopHit = true; stopIndex = i; }
+          if (Number.isFinite(c.high) && c.high >= trade.tp && tpIndex === -1) { tpHit = true; tpIndex = i; }
         } else {
-          if (c.high >= trade.sl) { closedStatus = "SL_HIT"; break; }
-          if (c.low <= trade.tp) { closedStatus = "TP_HIT"; break; }
+          if (Number.isFinite(c.high) && c.high >= trade.sl && stopIndex === -1) { stopHit = true; stopIndex = i; }
+          if (Number.isFinite(c.low) && c.low <= trade.tp && tpIndex === -1) { tpHit = true; tpIndex = i; }
         }
+      }
+
+      const currentPrice = candles[candles.length - 1].close;
+      if (trade.direction === "LONG") {
+        if (currentPrice <= trade.sl && stopIndex === -1) { stopHit = true; stopIndex = signalCandles.length; }
+        if (currentPrice >= trade.tp && tpIndex === -1) { tpHit = true; tpIndex = signalCandles.length; }
+      } else {
+        if (currentPrice >= trade.sl && stopIndex === -1) { stopHit = true; stopIndex = signalCandles.length; }
+        if (currentPrice <= trade.tp && tpIndex === -1) { tpHit = true; tpIndex = signalCandles.length; }
+      }
+
+      let closedStatus = null;
+      if (tpHit && stopHit) {
+        closedStatus = tpIndex < stopIndex ? "TP_HIT" : "SL_HIT";
+      } else if (tpHit) {
+        closedStatus = "TP_HIT";
+      } else if (stopHit) {
+        closedStatus = "SL_HIT";
       }
 
       if (closedStatus) {
