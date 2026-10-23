@@ -1,12 +1,1 @@
-[
-  {
-    "symbol": "SNXUSDT",
-    "exchange": "okx",
-    "direction": "SHORT",
-    "entry": 0.2137,
-    "sl": 0.21576428571428571,
-    "tp": 0.2106,
-    "confirmationTime": 1792764000000,
-    "status": "OPEN"
-  }
-]
+[]
