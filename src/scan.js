@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path from 'path';
+
 const EXCHANGES = {
   binance: { name: "Binance", base: "https://fapi1.binance.com" },
   okx: { name: "OKX", base: "https://www.okx.com" },
@@ -9,6 +12,7 @@ const CONFIG = {
   INTERVAL_MS: 15 * 60 * 1000,
   FETCH_CANDLES: 130,
   MIN_CANDLES_REQUIRED: 30,
+  TRADES_FILE: path.resolve('src', 'trades.json'),
 
   TOP_SYMBOL_COUNT: 9999999999,
   MIN_QUOTE_VOLUME_24H: 500000,
@@ -34,6 +38,21 @@ const CONFIG = {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function loadTrades() {
+  try {
+    if (fs.existsSync(CONFIG.TRADES_FILE)) {
+      return JSON.parse(fs.readFileSync(CONFIG.TRADES_FILE, 'utf8'));
+    }
+  } catch (e) {}
+  return [];
+}
+
+function saveTrades(trades) {
+  try {
+    fs.writeFileSync(CONFIG.TRADES_FILE, JSON.stringify(trades, null, 2), 'utf8');
+  } catch (e) {}
+}
+
 async function fetchWithRetry(url, exchangeName, validateJson) {
   let lastError = null;
 
@@ -58,21 +77,16 @@ async function fetchWithRetry(url, exchangeName, validateJson) {
         continue;
       }
 
-      if (!response.ok) {
-        throw new Error(`${exchangeName} HTTP ${response.status}`);
-      }
+      if (!response.ok) throw new Error(`${exchangeName} HTTP ${response.status}`);
 
       const json = await response.json();
       validateJson(json);
       return json;
     } catch (error) {
       lastError = error;
-      if (attempt < CONFIG.API_MAX_RETRIES - 1) {
-        await sleep(500 * (attempt + 1));
-      }
+      if (attempt < CONFIG.API_MAX_RETRIES - 1) await sleep(500 * (attempt + 1));
     }
   }
-
   throw lastError || new Error(`${exchangeName} failed after retries`);
 }
 
@@ -86,71 +100,36 @@ function createExchangeFetcher(baseUrl, exchangeName, validator) {
   };
 }
 
-const binanceFetch = createExchangeFetcher(
-  EXCHANGES.binance.base,
-  "Binance",
-  (json) => {
-    if (json == null || (Array.isArray(json) && json.length === 0)) {
-      throw new Error(`Binance: invalid or empty response`);
-    }
-  }
-);
+const binanceFetch = createExchangeFetcher(EXCHANGES.binance.base, "Binance", (json) => {
+  if (json == null || (Array.isArray(json) && json.length === 0)) throw new Error(`Binance: invalid response`);
+});
 
-const okxFetch = createExchangeFetcher(
-  EXCHANGES.okx.base,
-  "OKX",
-  (json) => {
-    if (!json || json.code !== "0") throw new Error(`OKX: ${json?.msg || "unknown error"}`);
-  }
-);
+const okxFetch = createExchangeFetcher(EXCHANGES.okx.base, "OKX", (json) => {
+  if (!json || json.code !== "0") throw new Error(`OKX: ${json?.msg || "unknown error"}`);
+});
 
-const mexcFetch = createExchangeFetcher(
-  EXCHANGES.mexc.base,
-  "MEXC",
-  (json) => {
-    if (json == null || (json.success !== undefined && !json.success)) {
-      throw new Error(`MEXC: invalid response`);
-    }
-  }
-);
+const mexcFetch = createExchangeFetcher(EXCHANGES.mexc.base, "MEXC", (json) => {
+  if (json == null || (json.success !== undefined && !json.success)) throw new Error(`MEXC: invalid response`);
+});
 
 async function fetchBinanceSymbols() {
   const json = await binanceFetch("/fapi/v1/exchangeInfo");
   return (json.symbols || [])
-    .filter(
-      (item) =>
-        item.status === "TRADING" &&
-        item.quoteAsset === "USDT" &&
-        item.contractType === "PERPETUAL"
-    )
-    .map((item) => ({
-      symbol: item.symbol,
-      base: item.baseAsset,
-      exchange: "binance",
-      raw: item.symbol,
-    }));
+    .filter((item) => item.status === "TRADING" && item.quoteAsset === "USDT" && item.contractType === "PERPETUAL")
+    .map((item) => ({ symbol: item.symbol, base: item.baseAsset, exchange: "binance", raw: item.symbol }));
 }
 
 async function fetchBinanceTickers() {
   const json = await binanceFetch("/fapi/v1/ticker/24hr");
   return json
     .filter((item) => item.symbol.endsWith("USDT"))
-    .map((item) => {
-      const volume = parseFloat(item.quoteVolume || "0");
-      return { symbol: item.symbol, volume: Number.isFinite(volume) ? volume : 0 };
-    });
+    .map((item) => ({ symbol: item.symbol, volume: parseFloat(item.quoteVolume || "0") || 0 }));
 }
 
 async function fetchOKXSymbols() {
   const json = await okxFetch("/api/v5/public/instruments", { instType: "SWAP" });
   return (json.data || [])
-    .filter(
-      (item) =>
-        item.state === "live" &&
-        item.settleCcy === "USDT" &&
-        item.ctType === "linear" &&
-        item.instId.endsWith("-USDT-SWAP")
-    )
+    .filter((item) => item.state === "live" && item.settleCcy === "USDT" && item.ctType === "linear" && item.instId.endsWith("-USDT-SWAP"))
     .map((item) => {
       const base = item.instId.split("-")[0];
       return { symbol: `${base}USDT`, base, exchange: "okx", raw: item.instId };
@@ -163,37 +142,22 @@ async function fetchOKXTickers() {
     .filter((item) => item.instId.endsWith("-USDT-SWAP"))
     .map((item) => {
       const base = item.instId.split("-")[0];
-      const volume = parseFloat(item.volCcy24h || "0");
-      return { symbol: `${base}USDT`, volume: Number.isFinite(volume) ? volume : 0 };
+      return { symbol: `${base}USDT`, volume: parseFloat(item.volCcy24h || "0") || 0 };
     });
 }
 
 async function fetchMEXCSymbols() {
   const json = await mexcFetch("/api/v1/contract/detail");
   return (json.data || [])
-    .filter(
-      (item) =>
-        item.state === 0 &&
-        item.quoteCoin === "USDT" &&
-        item.settleCoin === "USDT"
-    )
-    .map((item) => ({
-      symbol: item.symbol,
-      base: item.baseCoin,
-      exchange: "mexc",
-      raw: item.symbol,
-    }));
+    .filter((item) => item.state === 0 && item.quoteCoin === "USDT" && item.settleCoin === "USDT")
+    .map((item) => ({ symbol: item.symbol, base: item.baseCoin, exchange: "mexc", raw: item.symbol }));
 }
 
 async function fetchMEXCTickers() {
   const json = await mexcFetch("/api/v1/contract/ticker");
   return (json.data || [])
     .filter((item) => item.symbol.endsWith("_USDT"))
-    .map((item) => {
-      const symbol = item.symbol.replace("_USDT", "USDT");
-      const volume = parseFloat(item.amount24 || "0");
-      return { symbol, volume: Number.isFinite(volume) ? volume : 0 };
-    });
+    .map((item) => ({ symbol: item.symbol.replace("_USDT", "USDT"), volume: parseFloat(item.amount24 || "0") || 0 }));
 }
 
 async function getTopSymbols() {
@@ -204,24 +168,12 @@ async function getTopSymbols() {
     { name: "mexc", fetchSymbols: fetchMEXCSymbols, fetchTickers: fetchMEXCTickers },
   ];
 
-  const orderedSources = CONFIG.ANALYSIS_ORDER
-    .map((name) => exchangeSources.find((ex) => ex.name === name))
-    .filter(Boolean);
+  const orderedSources = CONFIG.ANALYSIS_ORDER.map((name) => exchangeSources.find((ex) => ex.name === name)).filter(Boolean);
 
   for (const exchange of orderedSources) {
     try {
-      console.log(`  Trying ${exchange.name}...`);
-      const [symbols, tickers] = await Promise.all([
-        exchange.fetchSymbols(),
-        exchange.fetchTickers(),
-      ]);
-
-      console.log(`  ${exchange.name}: ${symbols.length} symbols, ${tickers.length} tickers`);
-
-      if (!symbols || symbols.length === 0) {
-        console.log(`  ${exchange.name}: empty symbols list`);
-        continue;
-      }
+      const [symbols, tickers] = await Promise.all([exchange.fetchSymbols(), exchange.fetchTickers()]);
+      if (!symbols || symbols.length === 0) continue;
 
       const volumeMap = new Map(tickers.map((t) => [t.symbol, t.volume]));
       const ranked = symbols
@@ -229,42 +181,23 @@ async function getTopSymbols() {
         .filter((s) => s.volume >= CONFIG.MIN_QUOTE_VOLUME_24H)
         .sort((a, b) => b.volume - a.volume);
 
-      console.log(`  ${exchange.name}: ${ranked.length} symbols after volume filter`);
       allCandidates.push(...ranked);
-    } catch (error) {
-      console.log(`  ${exchange.name}: ${error.message}`);
-    }
+    } catch (error) {}
   }
 
-  if (allCandidates.length === 0) {
-    throw new Error("No symbols from any exchange");
-  }
+  if (allCandidates.length === 0) throw new Error("No symbols");
 
   const uniqueMap = new Map();
   for (const item of allCandidates) {
     const existing = uniqueMap.get(item.symbol);
-    if (!existing || item.volume > existing.volume) {
-      uniqueMap.set(item.symbol, item);
-    }
+    if (!existing || item.volume > existing.volume) uniqueMap.set(item.symbol, item);
   }
 
-  return [...uniqueMap.values()]
-    .sort((a, b) => b.volume - a.volume)
-    .slice(0, CONFIG.TOP_SYMBOL_COUNT);
+  return [...uniqueMap.values()].sort((a, b) => b.volume - a.volume).slice(0, CONFIG.TOP_SYMBOL_COUNT);
 }
 
 function isValidCandle(c) {
-  return (
-    Number.isFinite(c.time) &&
-    Number.isFinite(c.open) &&
-    Number.isFinite(c.high) &&
-    Number.isFinite(c.low) &&
-    Number.isFinite(c.close) &&
-    c.high >= c.low &&
-    c.high >= Math.max(c.open, c.close) &&
-    c.low <= Math.min(c.open, c.close) &&
-    c.low > 0
-  );
+  return Number.isFinite(c.time) && Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close) && c.high >= c.low && c.high >= Math.max(c.open, c.close) && c.low <= Math.min(c.open, c.close) && c.low > 0;
 }
 
 async function getCandles(symbol, exchange) {
@@ -277,111 +210,63 @@ async function getCandles(symbol, exchange) {
       let candles = [];
 
       if (currentExchange === "binance") {
-        const json = await binanceFetch("/fapi/v1/klines", {
-          symbol,
-          interval: CONFIG.TIMEFRAME,
-          limit: String(CONFIG.FETCH_CANDLES),
-        });
-        if (!Array.isArray(json)) throw new Error("Invalid Binance candle response");
-        candles = json.map((row) => ({
-          time: Number(row[0]),
-          open: Number(row[1]),
-          high: Number(row[2]),
-          low: Number(row[3]),
-          close: Number(row[4]),
-          closed: Number(row[6]) <= Date.now(),
-        }));
+        const json = await binanceFetch("/fapi/v1/klines", { symbol, interval: CONFIG.TIMEFRAME, limit: String(CONFIG.FETCH_CANDLES) });
+        if (!Array.isArray(json)) throw new Error("Invalid Binance");
+        candles = json.map((row) => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), closed: Number(row[6]) <= Date.now() }));
       } else if (currentExchange === "okx") {
-        const json = await okxFetch("/api/v5/market/candles", {
-          instId: `${base}-USDT-SWAP`,
-          bar: CONFIG.TIMEFRAME,
-          limit: String(CONFIG.FETCH_CANDLES),
-        });
-        if (!Array.isArray(json.data)) throw new Error("Invalid OKX candle response");
-        candles = json.data.map((row) => ({
-          time: Number(row[0]),
-          open: Number(row[1]),
-          high: Number(row[2]),
-          low: Number(row[3]),
-          close: Number(row[4]),
-          closed: row[8] === "1",
-        }));
+        const json = await okxFetch("/api/v5/market/candles", { instId: `${base}-USDT-SWAP`, bar: CONFIG.TIMEFRAME, limit: String(CONFIG.FETCH_CANDLES) });
+        if (!Array.isArray(json.data)) throw new Error("Invalid OKX");
+        candles = json.data.map((row) => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), closed: row[8] === "1" }));
       } else if (currentExchange === "mexc") {
-        const json = await mexcFetch("/api/v1/contract/kline/" + symbol, {
-          interval: "Min15",
-        });
-        if (!json.data || !Array.isArray(json.data.time)) throw new Error("Invalid MEXC candle response");
-        
+        const json = await mexcFetch("/api/v1/contract/kline/" + symbol, { interval: "Min15" });
+        if (!json.data || !Array.isArray(json.data.time)) throw new Error("Invalid MEXC");
         const { time, open, high, low, close } = json.data;
-        candles = time.map((t, i) => ({
-          time: Number(t) * 1000,
-          open: Number(open[i]),
-          high: Number(high[i]),
-          low: Number(low[i]),
-          close: Number(close[i]),
-          closed: (Number(t) * 1000) + CONFIG.INTERVAL_MS <= Date.now(),
-        }));
+        candles = time.map((t, i) => ({ time: Number(t) * 1000, open: Number(open[i]), high: Number(high[i]), low: Number(low[i]), close: Number(close[i]), closed: (Number(t) * 1000) + CONFIG.INTERVAL_MS <= Date.now() }));
       }
 
       candles.sort((a, b) => a.time - b.time);
       const closed = candles.filter((c) => c.closed && isValidCandle(c));
-
       const unique = [];
       const seen = new Set();
       for (const c of closed) {
-        if (!seen.has(c.time)) {
-          seen.add(c.time);
-          unique.push(c);
-        }
+        if (!seen.has(c.time)) { seen.add(c.time); unique.push(c); }
       }
 
-      if (unique.length >= CONFIG.MIN_CANDLES_REQUIRED) {
-        return unique.slice(-CONFIG.FETCH_CANDLES);
-      }
-      throw new Error(`Only ${unique.length} valid candles from ${currentExchange}`);
+      if (unique.length >= CONFIG.MIN_CANDLES_REQUIRED) return unique.slice(-CONFIG.FETCH_CANDLES);
+      throw new Error(`Only ${unique.length} candles`);
     } catch (error) {
       lastError = error;
     }
   }
-
-  throw lastError || new Error("No candles available");
+  throw lastError || new Error("No candles");
 }
 
 function getDojiType(candle) {
   const range = candle.high - candle.low;
   if (!Number.isFinite(range) || range <= 0) return null;
-
   const body = Math.abs(candle.close - candle.open);
   if (body / range > CONFIG.DOJI_MAX_BODY_RATIO) return null;
-
   const upperWick = candle.high - Math.max(candle.open, candle.close);
   const lowerWick = Math.min(candle.open, candle.close) - candle.low;
-  if (upperWick < 0 || lowerWick < 0) return null;
-
+  if (upperWick < 0 || lowerWick < 0 || upperWick === 0 || lowerWick === 0) return null;
   const wickSum = upperWick + lowerWick;
   if (wickSum <= 0) return null;
-
-  if (upperWick === 0 || lowerWick === 0) return null;
-
   if (Math.abs(upperWick - lowerWick) / wickSum <= CONFIG.WICK_SYMMETRY_TOLERANCE) return "standard";
-
   return null;
 }
 
 function calculateATR(candles, period = 14) {
   if (!candles || candles.length < period + 1) return 0;
-
   const trs = [];
   for (let i = 0; i < candles.length; i++) {
     const c = candles[i];
-    if (i === 0) {
-      trs.push(c.high - c.low);
-    } else {
-      const prevClose = candles[i - 1].close;
-      trs.push(Math.max(c.high - c.low, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose)));
+    if (i === 0) trs.push(c.high - c.low);
+    else {
+      const pc = candles[i - 1].close;
+      trs.push(Math.max(c.high - c.low, Math.abs(c.high - pc), Math.abs(c.low - pc)));
     }
   }
-  return trs.slice(-period).reduce((sum, val) => sum + val, 0) / period;
+  return trs.slice(-period).reduce((s, v) => s + v, 0) / period;
 }
 
 function applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation, atrValue, sma50) {
@@ -389,14 +274,9 @@ function applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation
 
   if (CONFIG.USE_CONFIRMATION_ATR_FILTERS) {
     if (confirmationRange < atrValue * 0.5) return false;
-
     const confirmationBody = Math.abs(confirmation.close - confirmation.open);
     if (confirmationBody < atrValue * 0.3) return false;
-
-    const breakoutDistance = direction === "LONG"
-      ? confirmation.close - doji.high
-      : doji.low - confirmation.close;
-
+    const breakoutDistance = direction === "LONG" ? confirmation.close - doji.high : doji.low - confirmation.close;
     if (breakoutDistance > atrValue * 1.5) return false;
   }
 
@@ -416,7 +296,6 @@ function applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation
     }
 
     if (!Number.isFinite(recentHigh) || !Number.isFinite(recentLow)) return false;
-
     const range100 = recentHigh - recentLow;
     if (range100 <= 0) return false;
 
@@ -434,19 +313,16 @@ function applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation
       if (dojiMid < (recentHigh + recentLow) / 2) return false;
     }
   }
-
   return true;
 }
 
 function analyzeSymbol(candles) {
   if (!Array.isArray(candles) || candles.length < CONFIG.MIN_CANDLES_REQUIRED) return null;
-
   const atrValue = calculateATR(candles);
   if (!Number.isFinite(atrValue) || atrValue <= 0) return null;
 
   const confirmationIndex = candles.length - 1;
   const dojiIndex = confirmationIndex - 1;
-
   const doji = candles[dojiIndex];
   const confirmation = candles[confirmationIndex];
 
@@ -462,19 +338,14 @@ function analyzeSymbol(candles) {
   if (!Number.isFinite(dojiRange) || dojiRange <= 0) return null;
 
   const sma50Period = Math.min(50, candles.length);
-  const sma50 = candles.slice(-sma50Period).reduce((sum, c) => sum + c.close, 0) / sma50Period;
+  const sma50 = candles.slice(-sma50Period).reduce((s, c) => s + c.close, 0) / sma50Period;
 
-  const passedFilters = applyTechnicalFilters(
-    candles, dojiIndex, direction, doji, confirmation, atrValue, sma50
-  );
-  if (!passedFilters) return null;
+  if (!applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation, atrValue, sma50)) return null;
 
   const entry = confirmation.close;
-  
   const buffer = Math.max(dojiRange * CONFIG.SL_BUFFER_PERCENT, atrValue * CONFIG.SL_ATR_MULTIPLIER);
   const sl = direction === "LONG" ? doji.low - buffer : doji.high + buffer;
   const risk = Math.abs(entry - sl);
-
   if (!Number.isFinite(risk) || risk <= 0) return null;
 
   const lookbackStart = Math.max(0, dojiIndex - 100);
@@ -487,7 +358,6 @@ function analyzeSymbol(candles) {
   }
 
   let tp = direction === "LONG" ? entry + risk * CONFIG.MAX_RR : entry - risk * CONFIG.MAX_RR;
-
   const validLevels = structuralLevels.filter((level) => {
     const rr = direction === "LONG" ? (level - entry) / risk : (entry - level) / risk;
     return rr >= CONFIG.MIN_RR && rr <= CONFIG.MAX_RR;
@@ -515,7 +385,6 @@ function analyzeSymbol(candles) {
     risk,
     tp,
     rr: finalRR,
-    tradeStatus: "OPEN",
     dojiTime: doji.time,
     confirmationTime: confirmation.time,
     currentPrice: confirmation.close,
@@ -523,9 +392,7 @@ function analyzeSymbol(candles) {
 }
 
 function fmtPrice(value) {
-  return Number.isFinite(value)
-    ? value.toLocaleString("en-US", { maximumFractionDigits: 10, useGrouping: false })
-    : "N/A";
+  return Number.isFinite(value) ? value.toLocaleString("en-US", { maximumFractionDigits: 10, useGrouping: false }) : "N/A";
 }
 
 function fmtTime(timestamp) {
@@ -536,19 +403,21 @@ function escapeHtml(value) {
   return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+function calcProfitPercent(entry, targetPrice) {
+  if (!Number.isFinite(entry) || !Number.isFinite(targetPrice) || entry <= 0) return 0;
+  return Math.abs((targetPrice - entry) / entry) * 100;
+}
+
 function formatSignal(symbol, signal) {
   const isLong = signal.direction === "LONG";
-  const directionIcon = isLong ? "🟢" : "🔴";
-  const directionText = isLong ? "LONG" : "SHORT";
-
-  const statusText = `معامله باز است (R فعلی: 0.00)`;
-  const statusIcon = "⏳";
+  const dIcon = isLong ? "🟢" : "🔴";
+  const dText = isLong ? "LONG" : "SHORT";
 
   return (
     "📊 <b>تحلیل Doji</b>\n\n" +
-    `${directionIcon} <b>${escapeHtml(symbol)}</b>\n` +
+    `${dIcon} <b>${escapeHtml(symbol)}</b>\n` +
     `⏱ تایم‌فریم: ${CONFIG.TIMEFRAME}\n` +
-    `📌 وضعیت: ${directionIcon} <b>${directionText}</b>\n\n` +
+    `📌 وضعیت: ${dIcon} <b>${dText}</b>\n\n` +
     `💰 قیمت فعلی: <b>${fmtPrice(signal.currentPrice)}</b>\n\n` +
     "🎯 <b>Doji Setup فعال:</b>\n" +
     `🕯 نوع دوجی: <b>Standard</b>\n` +
@@ -557,7 +426,7 @@ function formatSignal(symbol, signal) {
     `📏 ریسک: <b>${fmtPrice(signal.risk)}</b>\n\n` +
     `🥇 TP: <b>${fmtPrice(signal.tp)}</b>\n` +
     `⚖️ R:R: <b>1:${signal.rr.toFixed(2)}</b>\n\n` +
-    `${statusIcon} <b>نتیجه: ${statusText}</b>\n` +
+    `⏳ <b>نتیجه: معامله باز است</b>\n` +
     `🕯 زمان تأیید: ${fmtTime(signal.confirmationTime)}\n\n` +
     "━━━━━━━━━━━━━━━━━━━━━━\n" +
     "💡 مدیریت ریسک و سرمایه:\n" +
@@ -567,34 +436,82 @@ function formatSignal(symbol, signal) {
   );
 }
 
+function formatTradeClosed(trade) {
+  const isLong = trade.direction === "LONG";
+  const dIcon = isLong ? "🟢" : "🔴";
+  const dText = isLong ? "LONG" : "SHORT";
+  const isWin = trade.status === "TP_HIT";
+  
+  const title = isWin ? "🏁 <b>معامله با موفقیت بسته شد</b>" : "🛑 <b>معامله با ضرر بسته شد</b>";
+  const reasonText = isWin ? "✅ تارگت زده شد" : "❌ حد ضرر فعال شد";
+  
+  const hitPrice = isWin ? trade.tp : trade.sl;
+  const profitPct = calcProfitPercent(trade.entry, hitPrice);
+  const profitSign = isWin ? "+" : "-";
+  const profitColor = isWin ? "🟢" : "🔴";
+
+  return (
+    title + "\n" +
+    "━━━━━━━━━━━━━━━━━━━━━━\n" +
+    `🔸 ارز: <b>${escapeHtml(trade.symbol)}</b>\n` +
+    `⏱ تایم‌فریم: ${CONFIG.TIMEFRAME}\n` +
+    `📌 جهت: ${dIcon} <b>${dText}</b>\n\n` +
+    `${reasonText}\n` +
+    `💰 سود/ضرر خالص (بدون اهرم): <b>${profitColor} ${profitSign}${profitPct.toFixed(2)}%</b>\n\n` +
+    `🎯 ورود: <b>${fmtPrice(trade.entry)}</b>\n` +
+    `🏁 خروج: <b>${fmtPrice(hitPrice)}</b>\n\n` +
+    "💡 مدیریت سرمایه را رعایت کنید. منتظر سیگنال بعدی باشید."
+  );
+}
+
 async function sendTelegram(token, chatId, message) {
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT_MS);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text: message, parse_mode: "HTML", disable_web_page_preview: true }),
+  });
+  const data = await res.json();
+  if (!res.ok || !data?.ok) throw new Error(data?.description || `Telegram error`);
+}
 
-  let response;
-  let data;
+async function checkOpenTrades(openTrades, token, chatId) {
+  if (openTrades.length === 0) return [];
+  
+  console.log(`Checking ${openTrades.length} open trades...`);
+  const remainingTrades = [];
 
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: message,
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-      }),
-      signal: controller.signal,
-    });
-    data = await response.json();
-  } finally {
-    clearTimeout(timeout);
+  for (const trade of openTrades) {
+    try {
+      const candles = await getCandles(trade.symbol, trade.exchange);
+      const relevantCandles = candles.filter(c => c.time > trade.confirmationTime);
+      let closedStatus = null;
+
+      for (const c of relevantCandles) {
+        if (trade.direction === "LONG") {
+          if (c.low <= trade.sl) { closedStatus = "SL_HIT"; break; }
+          if (c.high >= trade.tp) { closedStatus = "TP_HIT"; break; }
+        } else {
+          if (c.high >= trade.sl) { closedStatus = "SL_HIT"; break; }
+          if (c.low <= trade.tp) { closedStatus = "TP_HIT"; break; }
+        }
+      }
+
+      if (closedStatus) {
+        trade.status = closedStatus;
+        const message = formatTradeClosed(trade);
+        await sendTelegram(token, chatId, message);
+        console.log(`Trade closed: ${trade.symbol} -> ${closedStatus}`);
+      } else {
+        remainingTrades.push(trade);
+      }
+    } catch (error) {
+      console.error(`Failed to check ${trade.symbol}: ${error.message}`);
+      remainingTrades.push(trade);
+    }
   }
 
-  if (!response.ok || !data?.ok) {
-    throw new Error(data?.description || `Telegram error HTTP ${response.status}`);
-  }
+  return remainingTrades;
 }
 
 async function main() {
@@ -609,20 +526,22 @@ async function main() {
 
   console.log("Starting Doji scan...");
 
+  let openTrades = loadTrades();
+  openTrades = await checkOpenTrades(openTrades, token, chatId);
+
   let symbols = [];
   try {
     symbols = await getTopSymbols();
   } catch (error) {
     console.error("Failed to fetch symbols:", error.message);
+    saveTrades(openTrades);
     process.exit(1);
   }
 
   console.log(`Fetched ${symbols.length} symbols to analyze.`);
-  if (symbols.length > 0) {
-    console.log(`Top 5: ${symbols.slice(0, 5).map((i) => i.symbol).join(", ")}`);
-  }
 
   let signalCount = 0;
+  const openTradeSymbols = new Set(openTrades.map(t => t.symbol));
 
   for (let i = 0; i < symbols.length; i++) {
     if (Date.now() - startTime > CONFIG.TOTAL_TIMEOUT_MS) {
@@ -632,6 +551,10 @@ async function main() {
 
     const item = symbols[i];
 
+    if (openTradeSymbols.has(item.symbol)) {
+      continue;
+    }
+
     try {
       const candles = await getCandles(item.symbol, item.exchange);
       const signal = analyzeSymbol(candles);
@@ -640,18 +563,26 @@ async function main() {
         signalCount++;
         const message = formatSignal(item.symbol, signal);
         await sendTelegram(token, chatId, message);
-        console.log(`[${i + 1}/${symbols.length}] ${item.symbol} (${item.exchange}) -> ${signal.direction} (${signal.tradeStatus})`);
-      } else {
-        console.log(`[${i + 1}/${symbols.length}] ${item.symbol} (${item.exchange}) -> no confirmed Doji`);
+        console.log(`[${i + 1}/${symbols.length}] ${item.symbol} (${item.exchange}) -> ${signal.direction}`);
+        
+        openTrades.push({
+          symbol: item.symbol,
+          exchange: item.exchange,
+          direction: signal.direction,
+          entry: signal.entry,
+          sl: signal.sl,
+          tp: signal.tp,
+          confirmationTime: signal.confirmationTime,
+          status: "OPEN"
+        });
       }
-    } catch (error) {
-      console.log(`[${i + 1}/${symbols.length}] ${item.symbol} (${item.exchange}) -> ${error.message}`);
-    }
+    } catch (error) {}
 
     await sleep(CONFIG.MESSAGE_DELAY_MS);
   }
 
-  console.log(`Scan complete. Found and sent ${signalCount} signal(s).`);
+  saveTrades(openTrades);
+  console.log(`Scan complete. Sent ${signalCount} new signals. Total open trades: ${openTrades.length}`);
   process.exit(0);
 }
 
