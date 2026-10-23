@@ -1,1 +1,13 @@
-[]
+[
+  {
+    "symbol": "WCTUSDT",
+    "exchange": "okx",
+    "timeframe": "30m",
+    "direction": "LONG",
+    "entry": 0.03666,
+    "sl": 0.034852,
+    "tp": 0.04389199999999999,
+    "confirmationTime": 1792787400000,
+    "status": "OPEN"
+  }
+]
