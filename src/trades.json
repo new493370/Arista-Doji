@@ -1,15 +1,5 @@
 [
   {
-    "symbol": "COREUSDT",
-    "exchange": "okx",
-    "direction": "SHORT",
-    "entry": 0.01748,
-    "sl": 0.01765857142857143,
-    "tp": 0.01721,
-    "confirmationTime": 1792764000000,
-    "status": "OPEN"
-  },
-  {
     "symbol": "SNXUSDT",
     "exchange": "okx",
     "direction": "SHORT",
