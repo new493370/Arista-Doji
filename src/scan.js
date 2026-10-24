@@ -11,7 +11,7 @@ const CONFIG = {
   TIMEFRAME: "15m",
   INTERVAL_MS: 15 * 60 * 1000,
   FETCH_CANDLES: 130,
-  MIN_CANDLES_REQUIRED: 30,
+  MIN_CANDLES_REQUIRED: 60,
   TRADES_FILE: path.resolve('src', 'trades.json'),
 
   TOP_SYMBOL_COUNT: 9999999999,
@@ -34,7 +34,7 @@ const CONFIG = {
   MIN_WICK_RATIO: 0.05,
 
   SL_BUFFER_PERCENT: 0,
-  SL_ATR_MULTIPLIER: 0.8,
+  SL_ATR_MULTIPLIER: 0.5,
   MIN_RR: 1.0,
   MAX_RR: 5,
 
@@ -45,10 +45,17 @@ const CONFIG = {
   RANGE_LOW_TOLERANCE: 0.05,
   RANGE_HIGH_TOLERANCE: 0.10,
 
+  PRE_CANDLE_MIN_ATR: 1.0,
+  TREND_SLOPE_LOOKBACK: 20,
+  TREND_SLOPE_MIN: 0.005,
+  SMA_FAR_PERCENT: 0.03,
+
   USE_CONFIRMATION_ATR_FILTERS: true,
   USE_SMA_FILTER: true,
   USE_RANGE_POSITION_FILTER: true,
   USE_VOLUME_FILTER: true,
+  USE_PRE_CANDLE_DIRECTION: true,
+  USE_TREND_SLOPE_FILTER: true,
 
   SYMBOL_CACHE_SECONDS: 3600,
   TICKERS_CACHE_SECONDS: 300,
@@ -87,10 +94,9 @@ async function withRateLimit(exchange, fn) {
 async function runWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
   let nextIndex = 0;
-  let stopped = false;
 
   async function runner() {
-    while (!stopped) {
+    while (true) {
       const currentIndex = nextIndex++;
       if (currentIndex >= items.length) return;
       try {
@@ -512,6 +518,29 @@ function calculateATR(candles, period = 14) {
   return trs.slice(-period).reduce((s, v) => s + v, 0) / period;
 }
 
+function checkPreCandleDirection(preCandle, direction) {
+  if (!CONFIG.USE_PRE_CANDLE_DIRECTION) return true;
+  const isBull = preCandle.close > preCandle.open;
+  const isBear = preCandle.close < preCandle.open;
+  if (direction === "LONG") return isBear;
+  if (direction === "SHORT") return isBull;
+  return false;
+}
+
+function checkTrendSlope(candles, dojiIndex, direction) {
+  if (!CONFIG.USE_TREND_SLOPE_FILTER) return true;
+  const lookbackStart = Math.max(0, dojiIndex - CONFIG.TREND_SLOPE_LOOKBACK);
+  const slice = candles.slice(lookbackStart, dojiIndex);
+  if (slice.length < 10) return false;
+  const first = slice[0].close;
+  const last = slice[slice.length - 1].close;
+  if (!Number.isFinite(first) || first <= 0) return false;
+  const slope = (last - first) / first;
+  if (direction === "LONG") return slope <= -CONFIG.TREND_SLOPE_MIN;
+  if (direction === "SHORT") return slope >= CONFIG.TREND_SLOPE_MIN;
+  return false;
+}
+
 function applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation, atrValue, sma50) {
   const confirmationRange = confirmation.high - confirmation.low;
 
@@ -524,8 +553,8 @@ function applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation
   }
 
   if (CONFIG.USE_SMA_FILTER) {
-    if (direction === "LONG" && doji.close < sma50) return false;
-    if (direction === "SHORT" && doji.close > sma50) return false;
+    if (direction === "LONG" && doji.close > sma50 * (1 + CONFIG.SMA_FAR_PERCENT)) return false;
+    if (direction === "SHORT" && doji.close < sma50 * (1 - CONFIG.SMA_FAR_PERCENT)) return false;
   }
 
   if (CONFIG.USE_VOLUME_FILTER) {
@@ -559,11 +588,11 @@ function applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation
 
     if (direction === "LONG") {
       if (distanceFromHigh < CONFIG.RANGE_HIGH_TOLERANCE) return false;
-      if (distanceFromLow > 0.35) return false;
+      if (distanceFromLow > 0.40) return false;
       if (dojiMid > mid) return false;
     } else {
       if (distanceFromLow < CONFIG.RANGE_HIGH_TOLERANCE) return false;
-      if (distanceFromHigh > 0.35) return false;
+      if (distanceFromHigh > 0.40) return false;
       if (dojiMid < mid) return false;
     }
   }
@@ -579,14 +608,23 @@ function analyzeSymbol(candles) {
   const dojiIndex = confirmationIndex - 1;
   const doji = candles[dojiIndex];
   const confirmation = candles[confirmationIndex];
+  const preCandle = candles[dojiIndex - 1];
+
+  if (!doji || !confirmation || !preCandle) return null;
 
   const kind = getDojiType(doji);
   if (!kind) return null;
 
+  const preRange = preCandle.high - preCandle.low;
+  if (preRange < atrValue * CONFIG.PRE_CANDLE_MIN_ATR) return null;
+
   let direction = null;
-  if (confirmation.close > doji.high) direction = "LONG";
-  else if (confirmation.close < doji.low) direction = "SHORT";
+  if (confirmation.close > doji.high && confirmation.close > confirmation.open) direction = "LONG";
+  else if (confirmation.close < doji.low && confirmation.close < confirmation.open) direction = "SHORT";
   else return null;
+
+  if (!checkPreCandleDirection(preCandle, direction)) return null;
+  if (!checkTrendSlope(candles, dojiIndex, direction)) return null;
 
   const dojiRange = doji.high - doji.low;
   if (!Number.isFinite(dojiRange) || dojiRange <= 0) return null;
@@ -604,31 +642,47 @@ function analyzeSymbol(candles) {
   const sl = direction === "LONG" ? doji.low - buffer : doji.high + buffer;
   const risk = Math.abs(entry - sl);
   if (!Number.isFinite(risk) || risk <= 0) return null;
+  if ((risk / entry) * 100 < 0.3) return null;
+  if ((risk / entry) * 100 > 5) return null;
 
   const lookbackStart = Math.max(0, dojiIndex - 100);
-  const structuralLevels = [];
 
-  for (let i = lookbackStart; i < dojiIndex; i++) {
-    const level = direction === "LONG" ? candles[i].high : candles[i].low;
-    if (direction === "LONG" && level > entry) structuralLevels.push(level);
-    if (direction === "SHORT" && level < entry) structuralLevels.push(level);
+  let structuralTP = null;
+  if (direction === "LONG") {
+    let nearest = Infinity;
+    for (let i = lookbackStart; i < dojiIndex; i++) {
+      const lvl = candles[i].high;
+      if (lvl > entry + risk * CONFIG.MIN_RR && lvl < nearest) nearest = lvl;
+    }
+    if (nearest !== Infinity) structuralTP = nearest;
+  } else {
+    let nearest = -Infinity;
+    for (let i = lookbackStart; i < dojiIndex; i++) {
+      const lvl = candles[i].low;
+      if (lvl < entry - risk * CONFIG.MIN_RR && lvl > nearest) nearest = lvl;
+    }
+    if (nearest !== -Infinity) structuralTP = nearest;
   }
 
-  const validLevels = structuralLevels.filter((level) => {
-    const rr = direction === "LONG" ? (level - entry) / risk : (entry - level) / risk;
-    return rr >= CONFIG.MIN_RR && rr <= CONFIG.MAX_RR;
-  });
+  let tp;
+  let finalRR;
 
-  if (validLevels.length === 0) return null;
-
-  validLevels.sort((a, b) => direction === "LONG" ? a - b : b - a);
-  const tp = validLevels[0];
+  if (structuralTP !== null) {
+    const structuralRR = Math.abs(structuralTP - entry) / risk;
+    if (structuralRR >= CONFIG.MIN_RR && structuralRR <= CONFIG.MAX_RR) {
+      tp = structuralTP;
+      finalRR = structuralRR;
+    } else {
+      tp = direction === "LONG" ? entry + risk * 2 : entry - risk * 2;
+      finalRR = 2.0;
+    }
+  } else {
+    tp = direction === "LONG" ? entry + risk * 2 : entry - risk * 2;
+    finalRR = 2.0;
+  }
 
   const reward = direction === "LONG" ? tp - entry : entry - tp;
   if (!Number.isFinite(reward) || reward <= 0) return null;
-
-  const finalRR = reward / risk;
-  if (finalRR < CONFIG.MIN_RR || finalRR > CONFIG.MAX_RR) return null;
 
   return {
     direction,
@@ -858,7 +912,7 @@ async function main() {
     try {
       const message = formatSignal(item.symbol, signal);
       await sendTelegram(token, chatId, message);
-      console.log(`${item.symbol} (${item.exchange}) -> ${signal.direction}`);
+      console.log(`${item.symbol} (${item.exchange}) -> ${signal.direction} (RR: ${signal.rr.toFixed(2)})`);
 
       openTrades.push({
         symbol: item.symbol,
