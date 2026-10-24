@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 
 const EXCHANGES = {
-  binance: { name: "Binance", base: "https://fapi1.binance.com" },
+  binance: { name: "Binance", futuresBase: "https://fapi1.binance.com", spotBase: "https://data-api.binance.vision" },
   okx: { name: "OKX", base: "https://www.okx.com" },
   mexc: { name: "MEXC", base: "https://contract.mexc.com" },
 };
@@ -20,7 +20,7 @@ const CONFIG = {
 
   API_MAX_RETRIES: 3,
   REQUEST_TIMEOUT_MS: 15000,
-  MESSAGE_DELAY_MS: 1500,
+  MESSAGE_DELAY_MS: 200,
   TOTAL_TIMEOUT_MS: 12 * 60 * 1000,
 
   DOJI_MAX_BODY_RATIO: 0.10,
@@ -42,6 +42,16 @@ const CONFIG = {
   USE_SMA_FILTER: true,
   USE_RANGE_POSITION_FILTER: true,
   USE_VOLUME_FILTER: true,
+
+  SYMBOL_CACHE_SECONDS: 3600,
+  TICKERS_CACHE_SECONDS: 300,
+
+  EXCLUDED_BASE_ASSETS: [
+    "USDT", "USDC", "FDUSD", "TUSD", "BUSD", "DAI",
+    "USDE", "USDS", "EUR", "TRY", "BRL", "GBP",
+    "AUD", "JPY", "RUB", "UAH", "PLN", "ARS",
+    "MXN", "ZAR", "USD1", "PYUSD", "USDP", "GUSD"
+  ],
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -85,6 +95,11 @@ async function fetchWithRetry(url, exchangeName, validateJson) {
         continue;
       }
 
+      if (response.status === 418) {
+        await sleep(Math.min(5000 * (attempt + 1), 30000));
+        continue;
+      }
+
       if (!response.ok) throw new Error(`${exchangeName} HTTP ${response.status}`);
 
       const json = await response.json();
@@ -108,8 +123,12 @@ function createExchangeFetcher(baseUrl, exchangeName, validator) {
   };
 }
 
-const binanceFetch = createExchangeFetcher(EXCHANGES.binance.base, "Binance", (json) => {
+const binanceFuturesFetch = createExchangeFetcher(EXCHANGES.binance.futuresBase, "Binance", (json) => {
   if (json == null || (Array.isArray(json) && json.length === 0)) throw new Error(`Binance: invalid response`);
+});
+
+const binanceSpotFetch = createExchangeFetcher(EXCHANGES.binance.spotBase, "BinanceSpot", (json) => {
+  if (json == null || (Array.isArray(json) && json.length === 0)) throw new Error(`BinanceSpot: invalid response`);
 });
 
 const okxFetch = createExchangeFetcher(EXCHANGES.okx.base, "OKX", (json) => {
@@ -120,96 +139,262 @@ const mexcFetch = createExchangeFetcher(EXCHANGES.mexc.base, "MEXC", (json) => {
   if (json == null || (json.success !== undefined && !json.success)) throw new Error(`MEXC: invalid response`);
 });
 
-async function fetchBinanceSymbols() {
-  const json = await binanceFetch("/fapi/v1/exchangeInfo");
-  return (json.symbols || [])
-    .filter((item) => item.status === "TRADING" && item.quoteAsset === "USDT" && item.contractType === "PERPETUAL")
-    .map((item) => ({ symbol: item.symbol, base: item.baseAsset, exchange: "binance", raw: item.symbol }));
+function isExcludedBase(base) {
+  if (!base) return true;
+  const upper = String(base).toUpperCase();
+  if (CONFIG.EXCLUDED_BASE_ASSETS.includes(upper)) return true;
+  if (/^X[A-Z]{4,}$/.test(upper)) return true;
+  if (upper.includes("TEST")) return true;
+  return false;
 }
 
-async function fetchBinanceTickers() {
-  const json = await binanceFetch("/fapi/v1/ticker/24hr");
-  return json
-    .filter((item) => item.symbol.endsWith("USDT"))
-    .map((item) => ({ symbol: item.symbol, volume: parseFloat(item.quoteVolume || "0") || 0 }));
+let symbolCache = { timestamp: 0, data: [] };
+let tickersCache = { timestamp: 0, data: [] };
+
+async function fetchBinanceSpotSymbols() {
+  const json = await binanceSpotFetch("/api/v3/exchangeInfo");
+  const result = [];
+  for (const item of json.symbols || []) {
+    if (item.status !== "TRADING") continue;
+    if (item.quoteAsset !== "USDT") continue;
+    const base = String(item.baseAsset || "").toUpperCase();
+    if (isExcludedBase(base)) continue;
+    result.push({ symbol: base + "USDT", base, exchange: "binance", raw: item.symbol });
+  }
+  return result;
+}
+
+async function fetchBinanceSpotTickers() {
+  const json = await binanceSpotFetch("/api/v3/ticker/24hr");
+  if (!Array.isArray(json)) return [];
+  const result = [];
+  for (const item of json) {
+    const raw = String(item.symbol || "").toUpperCase();
+    if (!raw.endsWith("USDT")) continue;
+    const base = raw.replace(/USDT$/, "");
+    if (isExcludedBase(base)) continue;
+    const last = parseFloat(item.lastPrice || "0");
+    const quoteVolume = parseFloat(item.quoteVolume || "0");
+    if (!Number.isFinite(last) || last <= 0) continue;
+    result.push({ symbol: base + "USDT", volume: Number.isFinite(quoteVolume) ? quoteVolume : 0 });
+  }
+  return result;
 }
 
 async function fetchOKXSymbols() {
   const json = await okxFetch("/api/v5/public/instruments", { instType: "SWAP" });
-  return (json.data || [])
-    .filter((item) => item.state === "live" && item.settleCcy === "USDT" && item.ctType === "linear" && item.instId.endsWith("-USDT-SWAP"))
-    .map((item) => {
-      const base = item.instId.split("-")[0];
-      return { symbol: `${base}USDT`, base, exchange: "okx", raw: item.instId };
-    });
+  const result = [];
+  for (const item of json.data || []) {
+    if (item.state !== "live") continue;
+    if (item.settleCcy !== "USDT") continue;
+    if (item.ctType !== "linear") continue;
+    if (!String(item.instId || "").endsWith("-USDT-SWAP")) continue;
+    const base = String(item.ctValCcy || item.baseCcy || item.instId.split("-")[0] || "").toUpperCase();
+    if (!base) continue;
+    if (isExcludedBase(base)) continue;
+    result.push({ symbol: base + "USDT", base, exchange: "okx", raw: item.instId });
+  }
+  return result;
 }
 
 async function fetchOKXTickers() {
   const json = await okxFetch("/api/v5/market/tickers", { instType: "SWAP" });
-  return (json.data || [])
-    .filter((item) => item.instId.endsWith("-USDT-SWAP"))
-    .map((item) => {
-      const base = item.instId.split("-")[0];
-      return { symbol: `${base}USDT`, volume: parseFloat(item.volCcy24h || "0") || 0 };
-    });
+  const result = [];
+  for (const item of json.data || []) {
+    if (!String(item.instId || "").endsWith("-USDT-SWAP")) continue;
+    const base = item.instId.split("-")[0];
+    if (!base) continue;
+    if (isExcludedBase(base)) continue;
+    const last = parseFloat(item.last || "0");
+    const volCcy24h = parseFloat(item.volCcy24h || "0");
+    const vol24h = parseFloat(item.vol24h || "0");
+    if (!Number.isFinite(last) || last <= 0) continue;
+    const quoteVolume =
+      Number.isFinite(volCcy24h) && volCcy24h > 0
+        ? volCcy24h
+        : Number.isFinite(vol24h)
+          ? vol24h * last
+          : 0;
+    result.push({ symbol: base + "USDT", volume: quoteVolume });
+  }
+  return result;
 }
 
 async function fetchMEXCSymbols() {
   const json = await mexcFetch("/api/v1/contract/detail");
-  return (json.data || [])
-    .filter((item) => item.state === 0 && item.quoteCoin === "USDT" && item.settleCoin === "USDT")
-    .map((item) => ({ symbol: item.symbol, base: item.baseCoin, exchange: "mexc", raw: item.symbol }));
+  const result = [];
+  for (const item of json.data || []) {
+    if (item.state !== 0) continue;
+    if (item.quoteCoin !== "USDT") continue;
+    if (item.settleCoin !== "USDT") continue;
+    const base = String(item.baseCoin || "").toUpperCase();
+    if (!base) continue;
+    if (isExcludedBase(base)) continue;
+    result.push({ symbol: base + "USDT", base, exchange: "mexc", raw: item.symbol });
+  }
+  return result;
 }
 
 async function fetchMEXCTickers() {
   const json = await mexcFetch("/api/v1/contract/ticker");
-  return (json.data || [])
-    .filter((item) => item.symbol.endsWith("_USDT"))
-    .map((item) => ({ symbol: item.symbol.replace("_USDT", "USDT"), volume: parseFloat(item.amount24 || "0") || 0 }));
+  const result = [];
+  for (const item of json.data || []) {
+    const raw = String(item.symbol || "").toUpperCase();
+    if (!raw.endsWith("USDT")) continue;
+    if (!raw.includes("_USDT")) continue;
+    const base = raw.replace(/_USDT$/, "").replace(/USDT$/, "");
+    if (!base) continue;
+    if (isExcludedBase(base)) continue;
+    const last = parseFloat(item.lastPrice || "0");
+    const quoteVolume = parseFloat(item.amount24 || item.volume24 || "0");
+    if (!Number.isFinite(last) || last <= 0) continue;
+    result.push({ symbol: base + "USDT", volume: Number.isFinite(quoteVolume) ? quoteVolume : 0 });
+  }
+  return result;
+}
+
+async function getExchangeSymbols() {
+  const now = Date.now();
+  if (symbolCache.data.length > 0 && (now - symbolCache.timestamp) < CONFIG.SYMBOL_CACHE_SECONDS * 1000) {
+    return symbolCache.data;
+  }
+
+  const allSymbols = new Map();
+  const sources = [
+    { name: "binance", fetcher: fetchBinanceSpotSymbols },
+    { name: "okx", fetcher: fetchOKXSymbols },
+    { name: "mexc", fetcher: fetchMEXCSymbols },
+  ];
+
+  await Promise.allSettled(
+    sources.map(async (src) => {
+      try {
+        const symbols = await src.fetcher();
+        for (const item of symbols) {
+          if (!allSymbols.has(item.symbol)) {
+            allSymbols.set(item.symbol, item);
+          }
+        }
+      } catch (e) {
+        console.error(`[${src.name}] symbols error:`, e.message || e);
+      }
+    })
+  );
+
+  const result = Array.from(allSymbols.values());
+  result.sort((a, b) => a.symbol.localeCompare(b.symbol));
+  symbolCache = { timestamp: now, data: result };
+  return result;
+}
+
+async function getTickers() {
+  const now = Date.now();
+  if (tickersCache.data.length > 0 && (now - tickersCache.timestamp) < CONFIG.TICKERS_CACHE_SECONDS * 1000) {
+    return tickersCache.data;
+  }
+
+  const validSymbols = await getExchangeSymbols();
+  const validSet = new Set(validSymbols.map((s) => s.symbol));
+
+  const bySymbol = new Map();
+  const sources = [
+    { name: "binance", fetcher: fetchBinanceSpotTickers },
+    { name: "okx", fetcher: fetchOKXTickers },
+    { name: "mexc", fetcher: fetchMEXCTickers },
+  ];
+
+  await Promise.allSettled(
+    sources.map(async (src) => {
+      try {
+        const tickers = await src.fetcher();
+        for (const t of tickers) {
+          if (!validSet.has(t.symbol)) continue;
+          const existing = bySymbol.get(t.symbol);
+          if (!existing || t.volume > existing.volume) {
+            bySymbol.set(t.symbol, { symbol: t.symbol, volume: t.volume, source: src.name });
+          }
+        }
+      } catch (e) {
+        console.error(`[${src.name}] tickers error:`, e.message || e);
+      }
+    })
+  );
+
+  const result = Array.from(bySymbol.values());
+  result.sort((a, b) => b.volume - a.volume);
+  tickersCache = { timestamp: now, data: result };
+  return result;
 }
 
 async function getTopSymbols() {
-  const allCandidates = [];
-  const exchangeSources = [
-    { name: "binance", fetchSymbols: fetchBinanceSymbols, fetchTickers: fetchBinanceTickers },
-    { name: "okx", fetchSymbols: fetchOKXSymbols, fetchTickers: fetchOKXTickers },
-    { name: "mexc", fetchSymbols: fetchMEXCSymbols, fetchTickers: fetchMEXCTickers },
-  ];
+  const symbols = await getExchangeSymbols();
+  const tickers = await getTickers();
 
-  const orderedSources = CONFIG.ANALYSIS_ORDER.map((name) => exchangeSources.find((ex) => ex.name === name)).filter(Boolean);
+  const symbolMap = new Map(symbols.map((s) => [s.symbol, s]));
+  const ranked = [];
 
-  for (const exchange of orderedSources) {
-    try {
-      const [symbols, tickers] = await Promise.all([exchange.fetchSymbols(), exchange.fetchTickers()]);
-      if (!symbols || symbols.length === 0) continue;
-
-      const volumeMap = new Map(tickers.map((t) => [t.symbol, t.volume]));
-      const ranked = symbols
-        .map((s) => ({ ...s, volume: volumeMap.get(s.symbol) || 0 }))
-        .filter((s) => s.volume >= CONFIG.MIN_QUOTE_VOLUME_24H)
-        .sort((a, b) => b.volume - a.volume);
-
-      allCandidates.push(...ranked);
-    } catch (error) {}
+  for (const ticker of tickers) {
+    if (!Number.isFinite(ticker.volume) || ticker.volume < CONFIG.MIN_QUOTE_VOLUME_24H) continue;
+    const symbolInfo = symbolMap.get(ticker.symbol);
+    if (!symbolInfo) continue;
+    ranked.push({ ...symbolInfo, volume: ticker.volume, exchange: symbolInfo.exchange });
   }
 
-  if (allCandidates.length === 0) throw new Error("No symbols");
-
-  const uniqueMap = new Map();
-  for (const item of allCandidates) {
-    const existing = uniqueMap.get(item.symbol);
-    if (!existing || item.volume > existing.volume) uniqueMap.set(item.symbol, item);
-  }
-
-  return [...uniqueMap.values()].sort((a, b) => b.volume - a.volume).slice(0, CONFIG.TOP_SYMBOL_COUNT);
+  ranked.sort((a, b) => b.volume - a.volume);
+  return ranked.slice(0, CONFIG.TOP_SYMBOL_COUNT);
 }
 
 function isValidCandle(c) {
   return Number.isFinite(c.time) && Number.isFinite(c.open) && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close) && c.high >= c.low && c.high >= Math.max(c.open, c.close) && c.low <= Math.min(c.open, c.close) && c.low > 0;
 }
 
-async function getCandles(symbol, exchange) {
+async function getCandlesFromBinance(symbol) {
+  const json = await binanceFuturesFetch("/fapi/v1/klines", { symbol, interval: CONFIG.TIMEFRAME, limit: String(CONFIG.FETCH_CANDLES) });
+  if (!Array.isArray(json)) throw new Error("Invalid Binance klines");
+  return json.map((row) => ({
+    time: Number(row[0]),
+    open: Number(row[1]),
+    high: Number(row[2]),
+    low: Number(row[3]),
+    close: Number(row[4]),
+    volume: Number(row[5]) || 0,
+    closed: Number(row[6]) <= Date.now(),
+  }));
+}
+
+async function getCandlesFromOKX(symbol) {
   const base = symbol.replace(/USDT$/, "");
+  const json = await okxFetch("/api/v5/market/candles", { instId: `${base}-USDT-SWAP`, bar: CONFIG.TIMEFRAME, limit: String(CONFIG.FETCH_CANDLES) });
+  if (!Array.isArray(json.data)) throw new Error("Invalid OKX klines");
+  return json.data.map((row) => ({
+    time: Number(row[0]),
+    open: Number(row[1]),
+    high: Number(row[2]),
+    low: Number(row[3]),
+    close: Number(row[4]),
+    volume: Number(row[5]) || 0,
+    closed: (Number(row[0]) + CONFIG.INTERVAL_MS) <= Date.now(),
+  }));
+}
+
+async function getCandlesFromMEXC(symbol) {
+  const base = symbol.replace(/USDT$/, "");
+  const mexcSymbol = base + "_USDT";
+  const json = await mexcFetch("/api/v1/contract/kline/" + mexcSymbol, { interval: "Min15", limit: String(CONFIG.FETCH_CANDLES) });
+  if (!json.data || !Array.isArray(json.data.time)) throw new Error("Invalid MEXC klines");
+  const { time, open, high, low, close, vol } = json.data;
+  return time.map((t, i) => ({
+    time: Number(t) * 1000,
+    open: Number(open[i]),
+    high: Number(high[i]),
+    low: Number(low[i]),
+    close: Number(close[i]),
+    volume: Number(vol?.[i]) || 0,
+    closed: (Number(t) * 1000) + CONFIG.INTERVAL_MS <= Date.now(),
+  }));
+}
+
+async function getCandles(symbol, exchange) {
   const exchangesToTry = [exchange, ...CONFIG.ANALYSIS_ORDER.filter((e) => e !== exchange)];
   let lastError = null;
 
@@ -218,18 +403,11 @@ async function getCandles(symbol, exchange) {
       let candles = [];
 
       if (currentExchange === "binance") {
-        const json = await binanceFetch("/fapi/v1/klines", { symbol, interval: CONFIG.TIMEFRAME, limit: String(CONFIG.FETCH_CANDLES) });
-        if (!Array.isArray(json)) throw new Error("Invalid Binance");
-        candles = json.map((row) => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[5]) || 0, closed: Number(row[6]) <= Date.now() }));
+        candles = await getCandlesFromBinance(symbol);
       } else if (currentExchange === "okx") {
-        const json = await okxFetch("/api/v5/market/candles", { instId: `${base}-USDT-SWAP`, bar: CONFIG.TIMEFRAME, limit: String(CONFIG.FETCH_CANDLES) });
-        if (!Array.isArray(json.data)) throw new Error("Invalid OKX");
-        candles = json.data.map((row) => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[5]) || 0, closed: (Number(row[0]) + CONFIG.INTERVAL_MS) <= Date.now() }));
+        candles = await getCandlesFromOKX(symbol);
       } else if (currentExchange === "mexc") {
-        const json = await mexcFetch("/api/v1/contract/kline/" + symbol, { interval: "Min15" });
-        if (!json.data || !Array.isArray(json.data.time)) throw new Error("Invalid MEXC");
-        const { time, open, high, low, close, vol } = json.data;
-        candles = time.map((t, i) => ({ time: Number(t) * 1000, open: Number(open[i]), high: Number(high[i]), low: Number(low[i]), close: Number(close[i]), volume: Number(vol?.[i]) || 0, closed: (Number(t) * 1000) + CONFIG.INTERVAL_MS <= Date.now() }));
+        candles = await getCandlesFromMEXC(symbol);
       }
 
       candles.sort((a, b) => a.time - b.time);
@@ -241,7 +419,7 @@ async function getCandles(symbol, exchange) {
       }
 
       if (unique.length >= CONFIG.MIN_CANDLES_REQUIRED) return unique.slice(-CONFIG.FETCH_CANDLES);
-      throw new Error(`Only ${unique.length} candles`);
+      throw new Error(`Only ${unique.length} candles on ${currentExchange}`);
     } catch (error) {
       lastError = error;
     }
@@ -625,10 +803,11 @@ async function main() {
           confirmationTime: signal.confirmationTime,
           status: "OPEN"
         });
+
+        openTradeSymbols.add(item.symbol);
+        await sleep(CONFIG.MESSAGE_DELAY_MS);
       }
     } catch (error) {}
-
-    await sleep(CONFIG.MESSAGE_DELAY_MS);
   }
 
   saveTrades(openTrades);
