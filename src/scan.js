@@ -25,15 +25,23 @@ const CONFIG = {
 
   DOJI_MAX_BODY_RATIO: 0.10,
   WICK_SYMMETRY_TOLERANCE: 0.15,
+  MIN_WICK_RATIO: 0.10,
 
   SL_BUFFER_PERCENT: 0,
   SL_ATR_MULTIPLIER: 1.2,
   MIN_RR: 1.5,
   MAX_RR: 4,
 
+  CONFIRMATION_MIN_RANGE_ATR: 0.5,
+  CONFIRMATION_MIN_BODY_ATR: 0.2,
+  CONFIRMATION_MAX_BREAKOUT_ATR: 1.5,
+  RANGE_LOW_TOLERANCE: 0.05,
+  RANGE_HIGH_TOLERANCE: 0.20,
+
   USE_CONFIRMATION_ATR_FILTERS: true,
   USE_SMA_FILTER: true,
   USE_RANGE_POSITION_FILTER: true,
+  USE_VOLUME_FILTER: true,
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -212,16 +220,16 @@ async function getCandles(symbol, exchange) {
       if (currentExchange === "binance") {
         const json = await binanceFetch("/fapi/v1/klines", { symbol, interval: CONFIG.TIMEFRAME, limit: String(CONFIG.FETCH_CANDLES) });
         if (!Array.isArray(json)) throw new Error("Invalid Binance");
-        candles = json.map((row) => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), closed: Number(row[6]) <= Date.now() }));
+        candles = json.map((row) => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[5]) || 0, closed: Number(row[6]) <= Date.now() }));
       } else if (currentExchange === "okx") {
         const json = await okxFetch("/api/v5/market/candles", { instId: `${base}-USDT-SWAP`, bar: CONFIG.TIMEFRAME, limit: String(CONFIG.FETCH_CANDLES) });
         if (!Array.isArray(json.data)) throw new Error("Invalid OKX");
-        candles = json.data.map((row) => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), closed: (Number(row[0]) + CONFIG.INTERVAL_MS) <= Date.now() }));
+        candles = json.data.map((row) => ({ time: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]), volume: Number(row[5]) || 0, closed: (Number(row[0]) + CONFIG.INTERVAL_MS) <= Date.now() }));
       } else if (currentExchange === "mexc") {
         const json = await mexcFetch("/api/v1/contract/kline/" + symbol, { interval: "Min15" });
         if (!json.data || !Array.isArray(json.data.time)) throw new Error("Invalid MEXC");
-        const { time, open, high, low, close } = json.data;
-        candles = time.map((t, i) => ({ time: Number(t) * 1000, open: Number(open[i]), high: Number(high[i]), low: Number(low[i]), close: Number(close[i]), closed: (Number(t) * 1000) + CONFIG.INTERVAL_MS <= Date.now() }));
+        const { time, open, high, low, close, vol } = json.data;
+        candles = time.map((t, i) => ({ time: Number(t) * 1000, open: Number(open[i]), high: Number(high[i]), low: Number(low[i]), close: Number(close[i]), volume: Number(vol?.[i]) || 0, closed: (Number(t) * 1000) + CONFIG.INTERVAL_MS <= Date.now() }));
       }
 
       candles.sort((a, b) => a.time - b.time);
@@ -248,9 +256,11 @@ function getDojiType(candle) {
   if (body / range > CONFIG.DOJI_MAX_BODY_RATIO) return null;
   const upperWick = candle.high - Math.max(candle.open, candle.close);
   const lowerWick = Math.min(candle.open, candle.close) - candle.low;
-  if (upperWick < 0 || lowerWick < 0 || upperWick === 0 || lowerWick === 0) return null;
+  if (upperWick < 0 || lowerWick < 0) return null;
   const wickSum = upperWick + lowerWick;
   if (wickSum <= 0) return null;
+  if (wickSum < range * CONFIG.MIN_WICK_RATIO) return null;
+  if (upperWick === 0 && lowerWick === 0) return null;
   if (Math.abs(upperWick - lowerWick) / wickSum <= CONFIG.WICK_SYMMETRY_TOLERANCE) return "standard";
   return null;
 }
@@ -273,16 +283,26 @@ function applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation
   const confirmationRange = confirmation.high - confirmation.low;
 
   if (CONFIG.USE_CONFIRMATION_ATR_FILTERS) {
-    if (confirmationRange < atrValue * 0.5) return false;
+    if (confirmationRange < atrValue * CONFIG.CONFIRMATION_MIN_RANGE_ATR) return false;
     const confirmationBody = Math.abs(confirmation.close - confirmation.open);
-    if (confirmationBody < atrValue * 0.3) return false;
+    if (confirmationBody < atrValue * CONFIG.CONFIRMATION_MIN_BODY_ATR) return false;
     const breakoutDistance = direction === "LONG" ? confirmation.close - doji.high : doji.low - confirmation.close;
-    if (breakoutDistance > atrValue * 1.5) return false;
+    if (breakoutDistance > atrValue * CONFIG.CONFIRMATION_MAX_BREAKOUT_ATR) return false;
   }
 
   if (CONFIG.USE_SMA_FILTER) {
     if (direction === "LONG" && doji.close < sma50) return false;
     if (direction === "SHORT" && doji.close > sma50) return false;
+  }
+
+  if (CONFIG.USE_VOLUME_FILTER) {
+    const volEnd = dojiIndex;
+    const volStart = Math.max(0, volEnd - 20);
+    const histVols = candles.slice(volStart, volEnd).map((c) => c.volume || 0).filter((v) => v > 0);
+    if (histVols.length >= 5) {
+      const avgVol = histVols.reduce((s, v) => s + v, 0) / histVols.length;
+      if (avgVol > 0 && (confirmation.volume || 0) < avgVol * 1.1) return false;
+    }
   }
 
   if (CONFIG.USE_RANGE_POSITION_FILTER) {
@@ -300,17 +320,18 @@ function applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation
     if (range100 <= 0) return false;
 
     const dojiMid = (doji.high + doji.low) / 2;
+    const mid = (recentHigh + recentLow) / 2;
     const distanceFromHigh = (recentHigh - doji.high) / range100;
+    const distanceFromLow = (doji.low - recentLow) / range100;
 
     if (direction === "LONG") {
-      if (distanceFromHigh < 0.20) return false;
-      if (doji.low > recentLow + range100 * 0.35) return false;
-      if (dojiMid > (recentHigh + recentLow) / 2) return false;
+      if (distanceFromHigh < CONFIG.RANGE_HIGH_TOLERANCE) return false;
+      if (distanceFromLow > 0.35) return false;
+      if (dojiMid > mid) return false;
     } else {
-      if (distanceFromHigh < 0.20) return false;
-      if (doji.high < recentHigh - range100 * 0.35) return false;
-      if (doji.low < recentLow * 1.002) return false;
-      if (dojiMid < (recentHigh + recentLow) / 2) return false;
+      if (distanceFromLow < CONFIG.RANGE_HIGH_TOLERANCE) return false;
+      if (distanceFromHigh > 0.35) return false;
+      if (dojiMid < mid) return false;
     }
   }
   return true;
@@ -337,8 +358,11 @@ function analyzeSymbol(candles) {
   const dojiRange = doji.high - doji.low;
   if (!Number.isFinite(dojiRange) || dojiRange <= 0) return null;
 
-  const sma50Period = Math.min(50, candles.length);
-  const sma50 = candles.slice(-sma50Period).reduce((s, c) => s + c.close, 0) / sma50Period;
+  const sma50Period = Math.min(50, dojiIndex + 1);
+  if (sma50Period < 5) return null;
+  const sma50Slice = candles.slice(dojiIndex + 1 - sma50Period, dojiIndex + 1);
+  const sma50 = sma50Slice.reduce((s, c) => s + c.close, 0) / sma50Slice.length;
+  if (!Number.isFinite(sma50) || sma50 <= 0) return null;
 
   if (!applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation, atrValue, sma50)) return null;
 
@@ -357,25 +381,21 @@ function analyzeSymbol(candles) {
     if (direction === "SHORT" && level < entry) structuralLevels.push(level);
   }
 
-  let tp = direction === "LONG" ? entry + risk * CONFIG.MAX_RR : entry - risk * CONFIG.MAX_RR;
   const validLevels = structuralLevels.filter((level) => {
     const rr = direction === "LONG" ? (level - entry) / risk : (entry - level) / risk;
     return rr >= CONFIG.MIN_RR && rr <= CONFIG.MAX_RR;
   });
 
-  if (validLevels.length > 0) {
-    validLevels.sort((a, b) => direction === "LONG" ? a - b : b - a);
-    tp = validLevels[0];
-  }
+  if (validLevels.length === 0) return null;
+
+  validLevels.sort((a, b) => direction === "LONG" ? a - b : b - a);
+  const tp = validLevels[0];
 
   const reward = direction === "LONG" ? tp - entry : entry - tp;
-  const rr = reward / risk;
+  if (!Number.isFinite(reward) || reward <= 0) return null;
 
-  if (!Number.isFinite(reward) || reward <= 0 || rr < CONFIG.MIN_RR || rr > CONFIG.MAX_RR) {
-    tp = direction === "LONG" ? entry + risk * CONFIG.MIN_RR : entry - risk * CONFIG.MIN_RR;
-  }
-
-  const finalRR = direction === "LONG" ? (tp - entry) / risk : (entry - tp) / risk;
+  const finalRR = reward / risk;
+  if (finalRR < CONFIG.MIN_RR || finalRR > CONFIG.MAX_RR) return null;
 
   return {
     direction,
@@ -441,10 +461,10 @@ function formatTradeClosed(trade) {
   const dIcon = isLong ? "🟢" : "🔴";
   const dText = isLong ? "LONG" : "SHORT";
   const isWin = trade.status === "TP_HIT";
-  
+
   const title = isWin ? "🏁 <b>معامله با موفقیت بسته شد</b>" : "🛑 <b>معامله با ضرر بسته شد</b>";
   const reasonText = isWin ? "✅ تارگت زده شد" : "❌ حد ضرر فعال شد";
-  
+
   const hitPrice = isWin ? trade.tp : trade.sl;
   const profitPct = calcProfitPercent(trade.entry, hitPrice);
   const profitSign = isWin ? "+" : "-";
@@ -477,19 +497,20 @@ async function sendTelegram(token, chatId, message) {
 
 async function checkOpenTrades(openTrades, token, chatId) {
   if (openTrades.length === 0) return [];
-  
+
   console.log(`Checking ${openTrades.length} open trades...`);
   const remainingTrades = [];
 
   for (const trade of openTrades) {
     try {
       const candles = await getCandles(trade.symbol, trade.exchange);
-      
+
       const sentTime = Number(trade.confirmationTime);
-      const signalCandles = candles.filter(c => c.time >= sentTime);
-      
-      if (signalCandles.length === 0 && candles.length > 0) {
-        signalCandles.push(candles[candles.length - 1]);
+      const signalCandles = candles.filter(c => c.time > sentTime);
+
+      if (signalCandles.length === 0) {
+        remainingTrades.push(trade);
+        continue;
       }
 
       let stopHit = false;
@@ -593,7 +614,7 @@ async function main() {
         const message = formatSignal(item.symbol, signal);
         await sendTelegram(token, chatId, message);
         console.log(`[${i + 1}/${symbols.length}] ${item.symbol} (${item.exchange}) -> ${signal.direction}`);
-        
+
         openTrades.push({
           symbol: item.symbol,
           exchange: item.exchange,
