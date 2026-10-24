@@ -618,22 +618,4 @@ async function main() {
 main().catch((error) => {
   console.error("Fatal error:", error.message);
   process.exit(1);
-});
-
-=============
-3. package.json
-
-{
-  "name": "doji-scan",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "description": "Doji scanner on 15m timeframe with GitHub Actions",
-  "main": "src/scan.js",
-  "scripts": {
-    "scan": "node src/scan.js"
-  },
-  "engines": {
-    "node": ">=20"
-  }
-}
+});}
