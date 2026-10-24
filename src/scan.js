@@ -23,20 +23,27 @@ const CONFIG = {
   MESSAGE_DELAY_MS: 200,
   TOTAL_TIMEOUT_MS: 12 * 60 * 1000,
 
+  CONCURRENCY: 25,
+  RATE_LIMIT_BINANCE: 15,
+  RATE_LIMIT_OKX: 8,
+  RATE_LIMIT_MEXC: 8,
+  RATE_LIMIT_WINDOW_MS: 1000,
+
   DOJI_MAX_BODY_RATIO: 0.10,
   WICK_SYMMETRY_TOLERANCE: 0.15,
-  MIN_WICK_RATIO: 0.10,
+  MIN_WICK_RATIO: 0.05,
 
   SL_BUFFER_PERCENT: 0,
-  SL_ATR_MULTIPLIER: 1.0,
-  MIN_RR: 1.2,
-  MAX_RR: 4,
+  SL_ATR_MULTIPLIER: 0.8,
+  MIN_RR: 1.0,
+  MAX_RR: 5,
 
-  CONFIRMATION_MIN_RANGE_ATR: 0.3,
-  CONFIRMATION_MIN_BODY_ATR: 0.15,
-  CONFIRMATION_MAX_BREAKOUT_ATR: 1.5,
+  CONFIRMATION_MIN_RANGE_ATR: 0.25,
+  CONFIRMATION_MIN_BODY_ATR: 0.10,
+  CONFIRMATION_MAX_BREAKOUT_ATR: 3.0,
+  CONFIRMATION_MIN_VOLUME_RATIO: 0.9,
   RANGE_LOW_TOLERANCE: 0.05,
-  RANGE_HIGH_TOLERANCE: 0.15,
+  RANGE_HIGH_TOLERANCE: 0.10,
 
   USE_CONFIRMATION_ATR_FILTERS: true,
   USE_SMA_FILTER: true,
@@ -55,6 +62,54 @@ const CONFIG = {
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const rateLimits = {
+  binance: { max: CONFIG.RATE_LIMIT_BINANCE, window: CONFIG.RATE_LIMIT_WINDOW_MS, timestamps: [] },
+  okx: { max: CONFIG.RATE_LIMIT_OKX, window: CONFIG.RATE_LIMIT_WINDOW_MS, timestamps: [] },
+  mexc: { max: CONFIG.RATE_LIMIT_MEXC, window: CONFIG.RATE_LIMIT_WINDOW_MS, timestamps: [] },
+};
+
+async function withRateLimit(exchange, fn) {
+  const rl = rateLimits[exchange];
+  if (!rl) return fn();
+
+  while (true) {
+    const now = Date.now();
+    rl.timestamps = rl.timestamps.filter((t) => now - t < rl.window);
+    if (rl.timestamps.length < rl.max) {
+      rl.timestamps.push(now);
+      return fn();
+    }
+    await sleep(20);
+  }
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  let stopped = false;
+
+  async function runner() {
+    while (!stopped) {
+      const currentIndex = nextIndex++;
+      if (currentIndex >= items.length) return;
+      try {
+        results[currentIndex] = await worker(items[currentIndex], currentIndex);
+      } catch (e) {
+        results[currentIndex] = null;
+      }
+    }
+  }
+
+  const runners = [];
+  const runnerCount = Math.min(concurrency, items.length || 1);
+  for (let i = 0; i < runnerCount; i++) {
+    runners.push(runner());
+  }
+  await Promise.all(runners);
+
+  return results;
+}
 
 function loadTrades() {
   try {
@@ -395,36 +450,36 @@ async function getCandlesFromMEXC(symbol) {
 }
 
 async function getCandles(symbol, exchange) {
-  const exchangesToTry = [exchange, ...CONFIG.ANALYSIS_ORDER.filter((e) => e !== exchange)];
-  let lastError = null;
+  try {
+    let candles = [];
 
-  for (const currentExchange of exchangesToTry) {
-    try {
-      let candles = [];
-
-      if (currentExchange === "binance") {
-        candles = await getCandlesFromBinance(symbol);
-      } else if (currentExchange === "okx") {
-        candles = await getCandlesFromOKX(symbol);
-      } else if (currentExchange === "mexc") {
-        candles = await getCandlesFromMEXC(symbol);
-      }
-
-      candles.sort((a, b) => a.time - b.time);
-      const closed = candles.filter((c) => c.closed && isValidCandle(c));
-      const unique = [];
-      const seen = new Set();
-      for (const c of closed) {
-        if (!seen.has(c.time)) { seen.add(c.time); unique.push(c); }
-      }
-
-      if (unique.length >= CONFIG.MIN_CANDLES_REQUIRED) return unique.slice(-CONFIG.FETCH_CANDLES);
-      throw new Error(`Only ${unique.length} candles on ${currentExchange}`);
-    } catch (error) {
-      lastError = error;
+    if (exchange === "binance") {
+      candles = await withRateLimit("binance", () => getCandlesFromBinance(symbol));
+    } else if (exchange === "okx") {
+      candles = await withRateLimit("okx", () => getCandlesFromOKX(symbol));
+    } else if (exchange === "mexc") {
+      candles = await withRateLimit("mexc", () => getCandlesFromMEXC(symbol));
+    } else {
+      return null;
     }
+
+    if (!Array.isArray(candles) || candles.length === 0) return null;
+
+    candles.sort((a, b) => a.time - b.time);
+    const closed = candles.filter((c) => c.closed && isValidCandle(c));
+    const unique = [];
+    const seen = new Set();
+    for (const c of closed) {
+      if (!seen.has(c.time)) { seen.add(c.time); unique.push(c); }
+    }
+
+    if (unique.length >= CONFIG.MIN_CANDLES_REQUIRED) {
+      return unique.slice(-CONFIG.FETCH_CANDLES);
+    }
+    return null;
+  } catch (error) {
+    return null;
   }
-  throw lastError || new Error("No candles");
 }
 
 function getDojiType(candle) {
@@ -479,7 +534,7 @@ function applyTechnicalFilters(candles, dojiIndex, direction, doji, confirmation
     const histVols = candles.slice(volStart, volEnd).map((c) => c.volume || 0).filter((v) => v > 0);
     if (histVols.length >= 5) {
       const avgVol = histVols.reduce((s, v) => s + v, 0) / histVols.length;
-      if (avgVol > 0 && (confirmation.volume || 0) < avgVol * 1.1) return false;
+      if (avgVol > 0 && (confirmation.volume || 0) < avgVol * CONFIG.CONFIRMATION_MIN_VOLUME_RATIO) return false;
     }
   }
 
@@ -683,6 +738,11 @@ async function checkOpenTrades(openTrades, token, chatId) {
     try {
       const candles = await getCandles(trade.symbol, trade.exchange);
 
+      if (!Array.isArray(candles) || candles.length === 0) {
+        remainingTrades.push(trade);
+        continue;
+      }
+
       const sentTime = Number(trade.confirmationTime);
       const signalCandles = candles.filter(c => c.time > sentTime);
 
@@ -768,50 +828,59 @@ async function main() {
 
   console.log(`Fetched ${symbols.length} symbols to analyze.`);
 
-  let signalCount = 0;
   const openTradeSymbols = new Set(openTrades.map(t => t.symbol));
 
-  for (let i = 0; i < symbols.length; i++) {
-    if (Date.now() - startTime > CONFIG.TOTAL_TIMEOUT_MS) {
-      console.log(`Timeout reached at symbol ${i + 1}/${symbols.length}`);
-      break;
-    }
+  const tasks = symbols.filter((item) => !openTradeSymbols.has(item.symbol));
 
-    const item = symbols[i];
+  console.log(`Analyzing ${tasks.length} symbols (concurrency: ${CONFIG.CONCURRENCY})...`);
 
-    if (openTradeSymbols.has(item.symbol)) {
-      continue;
-    }
+  const results = await runWithConcurrency(tasks, CONFIG.CONCURRENCY, async (item) => {
+    if (Date.now() - startTime > CONFIG.TOTAL_TIMEOUT_MS) return null;
 
     try {
       const candles = await getCandles(item.symbol, item.exchange);
+      if (!candles) return null;
       const signal = analyzeSymbol(candles);
+      if (!signal) return null;
+      return { item, signal };
+    } catch (error) {
+      return null;
+    }
+  });
 
-      if (signal) {
-        signalCount++;
-        const message = formatSignal(item.symbol, signal);
-        await sendTelegram(token, chatId, message);
-        console.log(`[${i + 1}/${symbols.length}] ${item.symbol} (${item.exchange}) -> ${signal.direction}`);
+  console.log(`Analysis done in ${((Date.now() - startTime) / 1000).toFixed(1)}s.`);
 
-        openTrades.push({
-          symbol: item.symbol,
-          exchange: item.exchange,
-          direction: signal.direction,
-          entry: signal.entry,
-          sl: signal.sl,
-          tp: signal.tp,
-          confirmationTime: signal.confirmationTime,
-          status: "OPEN"
-        });
+  const signals = results.filter((r) => r && r.item && r.signal);
 
-        openTradeSymbols.add(item.symbol);
-        await sleep(CONFIG.MESSAGE_DELAY_MS);
-      }
-    } catch (error) {}
+  let signalCount = 0;
+
+  for (const { item, signal } of signals) {
+    try {
+      const message = formatSignal(item.symbol, signal);
+      await sendTelegram(token, chatId, message);
+      console.log(`${item.symbol} (${item.exchange}) -> ${signal.direction}`);
+
+      openTrades.push({
+        symbol: item.symbol,
+        exchange: item.exchange,
+        direction: signal.direction,
+        entry: signal.entry,
+        sl: signal.sl,
+        tp: signal.tp,
+        confirmationTime: signal.confirmationTime,
+        status: "OPEN"
+      });
+
+      signalCount++;
+      await sleep(CONFIG.MESSAGE_DELAY_MS);
+    } catch (error) {
+      console.error(`Telegram error for ${item.symbol}:`, error.message);
+    }
   }
 
   saveTrades(openTrades);
-  console.log(`Scan complete. Sent ${signalCount} new signals. Total open trades: ${openTrades.length}`);
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`Scan complete in ${elapsed}s. Sent ${signalCount} new signals. Total open trades: ${openTrades.length}`);
   process.exit(0);
 }
 
